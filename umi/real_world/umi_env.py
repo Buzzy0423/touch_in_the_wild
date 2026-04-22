@@ -9,6 +9,12 @@ from multiprocessing.managers import SharedMemoryManager
 from umi.real_world.rtde_interpolation_controller import RTDEInterpolationController
 from umi.real_world.wsg_controller import WSGController
 from umi.real_world.franka_interpolation_controller import FrankaInterpolationController
+from umi.real_world.xarm_interpolation_controller import XArmInterpolationController
+from umi.real_world.xarm_gripper_controller import XArmGripperController
+from umi.real_world.xarm_gello_util import (
+    XARM7_GELLO_START_GRIPPER,
+    XARM7_GELLO_START_JOINTS,
+)
 from umi.real_world.multi_uvc_camera import MultiUvcCamera, VideoRecorder
 from diffusion_policy.common.timestamp_accumulator import (
     TimestampActionAccumulator,
@@ -258,14 +264,50 @@ class UmiEnv:
                 verbose=False,
                 receive_latency=robot_obs_latency
             )
-        
-        gripper = WSGController(
-            shm_manager=shm_manager,
-            hostname=gripper_ip,
-            port=gripper_port,
-            receive_latency=gripper_obs_latency,
-            use_meters=True
-        )
+        elif robot_type.startswith('xarm'):
+            xarm_j_init = None
+            if init_joints:
+                xarm_j_init = XARM7_GELLO_START_JOINTS.copy()
+            robot = XArmInterpolationController(
+                shm_manager=shm_manager,
+                robot_ip=robot_ip,
+                frequency=200,
+                lookahead_time=0.1,
+                gain=300,
+                max_pos_speed=max_pos_speed * cube_diag,
+                max_rot_speed=max_rot_speed * cube_diag,
+                launch_timeout=3,
+                tcp_offset_pose=None,
+                payload_mass=None,
+                payload_cog=None,
+                joints_init=xarm_j_init,
+                joints_init_speed=1.0,
+                soft_real_time=False,
+                verbose=False,
+                receive_latency=robot_obs_latency
+            )
+        else:
+            raise NotImplementedError(f"Unsupported robot_type: {robot_type}")
+
+        if robot_type.startswith('xarm'):
+            xarm_gripper_init = None
+            if init_joints:
+                xarm_gripper_init = XARM7_GELLO_START_GRIPPER
+            gripper = XArmGripperController(
+                shm_manager=shm_manager,
+                hostname=gripper_ip,
+                port=gripper_port,
+                startup_pos=xarm_gripper_init,
+                receive_latency=gripper_obs_latency
+            )
+        else:
+            gripper = WSGController(
+                shm_manager=shm_manager,
+                hostname=gripper_ip,
+                port=gripper_port,
+                receive_latency=gripper_obs_latency,
+                use_meters=True
+            )
 
         self.camera = camera
         self.robot = robot

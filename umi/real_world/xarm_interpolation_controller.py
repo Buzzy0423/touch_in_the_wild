@@ -18,6 +18,7 @@ from diffusion_policy.common.pose_trajectory_interpolator import PoseTrajectoryI
 from diffusion_policy.common.precise_sleep import precise_wait
 
 from xarm.wrapper import XArmAPI
+from umi.real_world.xarm_gello_util import xarm_pose_m_to_mm, xarm_pose_mm_to_m
 
 class Command(enum.Enum):
     STOP = 0
@@ -105,7 +106,7 @@ class XArmInterpolationController(mp.Process):
 
         # Build the ring buffer example
         example = {}
-        example['ActualTCPPose']   = np.array(actual_pose_aa)
+        example['ActualTCPPose']   = xarm_pose_mm_to_m(actual_pose_aa)
         example['ActualTCPSpeed']  = np.zeros(6, dtype=np.float64)
         example['ActualQ']         = np.array(actual_q)
         example['ActualQd']        = np.zeros(7, dtype=np.float64)
@@ -254,6 +255,10 @@ class XArmInterpolationController(mp.Process):
         dt = 1.0 / self.frequency
         # Get initial pose for the trajectory
         code, init_pos = arm.get_position_aa(is_radian=True)
+        if code != 0 or init_pos is None:
+            init_pos = np.zeros((6,), dtype=np.float64)
+        else:
+            init_pos = xarm_pose_mm_to_m(init_pos)
         curr_t = time.monotonic()
         last_waypoint_time = curr_t
 
@@ -276,8 +281,9 @@ class XArmInterpolationController(mp.Process):
                 target_pose_aa = pose_interp(t_now)
 
                 # Send servo command
+                target_pose_mm = xarm_pose_m_to_mm(target_pose_aa)
                 ret = arm.set_servo_cartesian_aa(
-                    target_pose_aa,
+                    target_pose_mm,
                     is_radian=True,
                     relative=False
                 )
@@ -367,7 +373,7 @@ class XArmInterpolationController(mp.Process):
         if code != 0 or actual_pose_aa is None:
             actual_pose_aa = np.zeros(6, dtype=np.float64)
 
-        #actual_pose_aa[:3] = actual_pose_aa[:3]/1000
+        actual_pose_aa = xarm_pose_mm_to_m(actual_pose_aa)
 
         # Actual joints
         code, actual_q_raw = arm.get_servo_angle(is_radian=True)

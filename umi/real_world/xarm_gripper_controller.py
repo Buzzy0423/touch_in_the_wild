@@ -11,6 +11,12 @@ from umi.common.pose_trajectory_interpolator import PoseTrajectoryInterpolator
 from diffusion_policy.common.precise_sleep import precise_wait
 
 from xarm.wrapper import XArmAPI
+from umi.real_world.xarm_gello_util import (
+    XARM_SDK_GRIPPER_CLOSE,
+    XARM_SDK_GRIPPER_OPEN,
+    gripper_gello_norm_to_raw,
+    gripper_raw_to_gello_norm,
+)
 
 class Command(enum.Enum):
     SHUTDOWN = 0
@@ -25,6 +31,7 @@ class XArmGripperController(mp.Process):
                  frequency=40,
                  home_to_open=True,
                  move_max_speed=5000.0,
+                 startup_pos=None,
                  get_max_k=None,
                  command_queue_size=1024,
                  launch_timeout=3,
@@ -44,9 +51,11 @@ class XArmGripperController(mp.Process):
         self.frequency = frequency
         self.home_to_open = home_to_open
         self.move_max_speed = move_max_speed
+        self.startup_pos = startup_pos
         self.launch_timeout = launch_timeout
         self.receive_latency = receive_latency
-        self.scale = 1000.0  # permanent scale for xArm gripper
+        self.gripper_range = abs(XARM_SDK_GRIPPER_CLOSE - XARM_SDK_GRIPPER_OPEN)
+        self.max_interp_speed = move_max_speed / self.gripper_range
         self.verbose = verbose
 
         if get_max_k is None:
@@ -123,7 +132,7 @@ class XArmGripperController(mp.Process):
     def schedule_waypoint(self, pos: float, target_time: float):
         message = {
             'cmd': Command.SCHEDULE_WAYPOINT.value,
-            'target_pos': pos,
+            'target_pos': float(np.asarray(pos).reshape(-1)[0]),
             'target_time': target_time
         }
         self.input_queue.put(message)
@@ -170,14 +179,24 @@ class XArmGripperController(mp.Process):
             if code != 0:
                 raise RuntimeError(f"Failed to set xArm gripper speed, code={code}")
 
+            if self.startup_pos is not None:
+                startup_pos = float(np.clip(self.startup_pos, 0.0, 1.0))
+                code = arm.set_gripper_position(
+                    float(gripper_gello_norm_to_raw(startup_pos)),
+                    wait=True
+                )
+                if code != 0:
+                    raise RuntimeError(
+                        f"Failed to move xArm gripper to startup_pos, code={code}"
+                    )
+
             # read initial position
             code, gpos = arm.get_gripper_position()
             if code != 0 or gpos is None:
                 gpos = 0.0
-            # print('initial gripper pose', gpos)
-            # Scale from mm to local coordinate
-            init_pos = gpos / self.scale
-            print('initial gripper pose', init_pos)
+            init_pos = float(gripper_raw_to_gello_norm(gpos))
+            if self.verbose:
+                print('initial gripper pose', init_pos)
 
             curr_t = time.monotonic()
             last_waypoint_time = curr_t
@@ -195,18 +214,15 @@ class XArmGripperController(mp.Process):
                 t_target = t_now
                 target_pos = pose_interp(t_target)[0]
 
-                # command xArm gripper in mm
-                # print("target pos", target_pos)
-                # print("self.scale", self.scale)
-                gripper_pos = target_pos * self.scale
-                # print("gripper_pos", gripper_pos)
+                target_pos = float(np.clip(target_pos, 0.0, 1.0))
+                gripper_pos = float(gripper_gello_norm_to_raw(target_pos))
                 code = arm.set_gripper_position(gripper_pos, wait=False)
 
                 # read back current pos
                 code, curr_gpos = arm.get_gripper_position()
                 if code != 0 or curr_gpos is None:
-                    curr_gpos = target_pos * self.scale
-                curr_gpos /= self.scale
+                    curr_gpos = gripper_pos
+                curr_gpos = float(gripper_raw_to_gello_norm(curr_gpos))
 
                 # put into ring buffer
                 state = {
@@ -237,8 +253,7 @@ class XArmGripperController(mp.Process):
                         keep_running = False
                         break
                     elif cmd == Command.SCHEDULE_WAYPOINT.value:
-                        # scale user pos from local range to mm
-                        target_pos = command['target_pos']
+                        target_pos = float(np.clip(command['target_pos'], 0.0, 1.0))
                         target_time = command['target_time']
                         # convert global time to monotonic
                         target_time = time.monotonic() - time.time() + target_time
@@ -246,8 +261,8 @@ class XArmGripperController(mp.Process):
                         pose_interp = pose_interp.schedule_waypoint(
                             pose=[target_pos,0,0,0,0,0],
                             time=target_time,
-                            max_pos_speed=self.move_max_speed,
-                            max_rot_speed=self.move_max_speed,
+                            max_pos_speed=self.max_interp_speed,
+                            max_rot_speed=self.max_interp_speed,
                             curr_time=curr_time,
                             last_waypoint_time=last_waypoint_time
                         )
