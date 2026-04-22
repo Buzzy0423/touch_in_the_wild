@@ -135,7 +135,7 @@ class UmiDataset(BaseDataset):
         train_mask = ~val_mask
         '''
         n_total_episodes  = replay_buffer.n_episodes
-        n_val_episodes    = min(10, n_total_episodes)          # never >10
+        n_val_episodes    = min(10, n_total_episodes)          # keep val set small
         rng               = np.random.default_rng(seed)        # reproducible
         val_indices       = rng.choice(
             n_total_episodes, size=n_val_episodes, replace=False

@@ -31,7 +31,6 @@ def main(docker_image, num_workers, no_docker_pull, session_dir):
     if not no_docker_pull:
         print(f"Pulling docker image {docker_image}")
         cmd = [
-            'sudo',
             'docker',
             'pull',
             docker_image
@@ -61,11 +60,12 @@ def main(docker_image, num_workers, no_docker_pull, session_dir):
                     json_path = mount_target.joinpath('imu_data.json')
 
                     # run imu extractor
+                    import os as _os
                     cmd = [
-                        'sudo',
                         'docker',
                         'run',
                         '--rm', # delete after finish
+                        '--user', f'{_os.getuid()}:{_os.getgid()}',
                         '--volume', str(video_dir) + ':' + '/data',
                         docker_image,
                         'node',

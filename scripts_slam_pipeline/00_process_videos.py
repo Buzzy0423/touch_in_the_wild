@@ -13,6 +13,21 @@ import shutil
 from exiftool import ExifToolHelper
 from umi.common.timecode_util import mp4_get_start_datetime
 
+
+def iter_real_mp4s(path):
+    for mp4_path in list(path.glob('**/*.MP4')) + list(path.glob('**/*.mp4')):
+        if mp4_path.is_symlink():
+            print(f"Skipping stale or already-moved symlink: {mp4_path.name}")
+            continue
+
+        # Skip overlay videos
+        if 'overlay' in mp4_path.name.lower():
+            print(f"Skipping overlay video: {mp4_path.name}")
+            continue
+
+        yield mp4_path
+
+
 # %%
 @click.command(help='Session directories. Assumming mp4 videos are in <session_dir>/raw_videos')
 @click.argument('session_dir', nargs=-1)
@@ -27,29 +42,26 @@ def main(session_dir):
         if not input_dir.is_dir():
             input_dir.mkdir()
             print(f"{input_dir.name} subdir don't exits! Creating one and moving all mp4 videos inside.")
-            for mp4_path in list(session.glob('**/*.MP4')) + list(session.glob('**/*.mp4')):
-                # Skip overlay videos
-                if 'overlay' in mp4_path.name.lower():
-                    print(f"Skipping overlay video: {mp4_path.name}")
-                    continue
-                
+            for mp4_path in iter_real_mp4s(session):
                 out_path = input_dir.joinpath(mp4_path.name)
                 shutil.move(mp4_path, out_path)
         
         # create mapping video if don't exist
-        mapping_vid_path = input_dir.joinpath('mapping.mp4')
+        mapping_vid_path = next(
+            (p for p in iter_real_mp4s(input_dir) if p.stem.lower() == 'mapping'),
+            input_dir.joinpath('mapping.mp4')
+        )
         if (not mapping_vid_path.exists()) and not(mapping_vid_path.is_symlink()):
             max_size = -1
             max_path = None
-            for mp4_path in list(input_dir.glob('**/*.MP4')) + list(input_dir.glob('**/*.mp4')):
-                # Skip overlay videos
-                if 'overlay' in mp4_path.name.lower():
-                    continue
-                
+            for mp4_path in iter_real_mp4s(input_dir):
                 size = mp4_path.stat().st_size
                 if size > max_size:
                     max_size = size
                     max_path = mp4_path
+
+            if max_path is None:
+                raise FileNotFoundError(f"No real MP4 videos found in {input_dir}")
             
             shutil.move(max_path, mapping_vid_path)
             print(f"raw_videos/mapping.mp4 don't exist! Renaming largest file {max_path.name}.")
@@ -64,11 +76,7 @@ def main(session_dir):
             serial_path_dict = dict()
             specific_video_name = "GX012840.MP4"
             with ExifToolHelper() as et:
-                for mp4_path in list(input_dir.glob('**/*.MP4')) + list(input_dir.glob('**/*.mp4')):
-                    # Skip overlay videos
-                    if 'overlay' in mp4_path.name.lower():
-                        continue
-                    
+                for mp4_path in iter_real_mp4s(input_dir):
                     if mp4_path.name.startswith('map'):
                         continue
                     
@@ -96,20 +104,11 @@ def main(session_dir):
                 shutil.move(path, out_path)
 
         # look for mp4 video in all subdirectories in input_dir
-        input_mp4_paths = list(input_dir.glob('**/*.MP4')) + list(input_dir.glob('**/*.mp4'))
+        input_mp4_paths = list(iter_real_mp4s(input_dir))
         print(f'Found {len(input_mp4_paths)} MP4 videos')
 
         with ExifToolHelper() as et:
             for mp4_path in input_mp4_paths:
-                # Skip overlay videos
-                if 'overlay' in mp4_path.name.lower():
-                    print(f"Skipping overlay video: {mp4_path.name}")
-                    continue
-
-                if mp4_path.is_symlink():
-                    print(f"Skipping {mp4_path.name}, already moved.")
-                    continue
-
                 start_date = mp4_get_start_datetime(str(mp4_path))
                 meta = list(et.get_metadata(str(mp4_path)))[0]
                 cam_serial = meta['QuickTime:CameraSerialNumber']

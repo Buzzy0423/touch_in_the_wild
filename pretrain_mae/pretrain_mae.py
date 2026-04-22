@@ -247,7 +247,7 @@ def main(cfg: Any) -> None:
         dataset_path=dataset_path,
         cache_dir=cfg.task.get("cache_dir"),
         val_ratio=cfg.training.val_ratio,
-        train_ratio=1-cfg.training.val_ratio,
+        train_ratio=float(max(0.0, min(1.0, cfg.training.get("train_ratio", 1.0)))),
         seed=cfg.training.seed,
         transforms=transform,
     )
@@ -258,19 +258,30 @@ def main(cfg: Any) -> None:
     print(f"[DATA] Train len : {len(dataset)}")
     print(f"[DATA] Val len   : {len(val_dataset)}")
 
+    num_workers = int(cfg.dataloader.get("num_workers", 8))
+    pin_memory = bool(cfg.dataloader.get("pin_memory", True))
+    dataloader_kwargs = dict(
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    # Zarr LMDB cache is not fork-safe on some systems. Use spawn for multi-worker loading.
+    if num_workers > 0:
+        dataloader_kwargs.update(
+            persistent_workers=True,
+            multiprocessing_context="spawn",
+        )
+
     train_loader = DataLoader(
         dataset,
         batch_size=cfg.dataloader.batch_size,
         shuffle=True,
-        num_workers=cfg.dataloader.get("num_workers", 8),
-        pin_memory=True,
+        **dataloader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg.dataloader.batch_size,
         shuffle=True,
-        num_workers=cfg.dataloader.get("num_workers", 8),
-        pin_memory=True,
+        **dataloader_kwargs,
     )
 
     wandb.init(

@@ -43,6 +43,7 @@ def main(input_dir, camera_intrinsics, aruco_yaml, num_workers):
         # one chunk per thread, therefore no synchronization needed
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = set()
+            results = []
             for video_dir in tqdm(input_video_dirs):
                 video_dir = video_dir.absolute()
                 video_path = video_dir.joinpath('raw_video.mp4')
@@ -53,7 +54,7 @@ def main(input_dir, camera_intrinsics, aruco_yaml, num_workers):
 
                 # run SLAM
                 cmd = [
-                    'python', script_path,
+                    sys.executable, script_path,
                     '--input', str(video_path),
                     '--output', str(pkl_path),
                     '--intrinsics_json', camera_intrinsics,
@@ -66,6 +67,7 @@ def main(input_dir, camera_intrinsics, aruco_yaml, num_workers):
                     completed, futures = concurrent.futures.wait(futures, 
                         return_when=concurrent.futures.FIRST_COMPLETED)
                     pbar.update(len(completed))
+                    results.extend(x.result() for x in completed)
 
                 futures.add(executor.submit(
                     lambda x: subprocess.run(x, 
@@ -75,9 +77,13 @@ def main(input_dir, camera_intrinsics, aruco_yaml, num_workers):
 
             completed, futures = concurrent.futures.wait(futures)            
             pbar.update(len(completed))
+            results.extend(x.result() for x in completed)
 
     print("Done! Result:")
-    print([x.result() for x in completed])
+    print(results)
+    failed = [x for x in results if x.returncode != 0]
+    if failed:
+        raise RuntimeError(f"{len(failed)} ArUco detection subprocesses failed")
 
 # %%
 if __name__ == "__main__":

@@ -47,7 +47,6 @@ def runner(cmd, cwd, stdout_path, stderr_path, timeout, **kwargs):
 def main(input_dir, map_path, docker_image, num_workers, max_lost_frames, timeout_multiple, no_docker_pull):
     input_dir = pathlib.Path(os.path.expanduser(input_dir)).absolute()
     input_video_dirs = [x.parent for x in input_dir.glob('demo*/raw_video.mp4')]
-    input_video_dirs += [x.parent for x in input_dir.glob('map*/raw_video.mp4')]
     print(f'Found {len(input_video_dirs)} video dirs')
     
     if map_path is None:
@@ -76,6 +75,7 @@ def main(input_dir, map_path, docker_image, num_workers, max_lost_frames, timeou
         # one chunk per thread, therefore no synchronization needed
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = set()
+            results = []
             for video_dir in tqdm(input_video_dirs):
                 video_dir = video_dir.absolute()
                 if video_dir.joinpath('camera_trajectory.csv').is_file():
@@ -132,6 +132,7 @@ def main(input_dir, map_path, docker_image, num_workers, max_lost_frames, timeou
                     completed, futures = concurrent.futures.wait(futures, 
                         return_when=concurrent.futures.FIRST_COMPLETED)
                     pbar.update(len(completed))
+                    results.extend(x.result() for x in completed)
 
                 futures.add(executor.submit(runner,
                     cmd, str(video_dir), stdout_path, stderr_path, timeout))
@@ -139,9 +140,16 @@ def main(input_dir, map_path, docker_image, num_workers, max_lost_frames, timeou
 
             completed, futures = concurrent.futures.wait(futures)
             pbar.update(len(completed))
+            results.extend(x.result() for x in completed)
 
     print("Done! Result:")
-    print([x.result() for x in completed])
+    print(results)
+    failed = [
+        x for x in results
+        if isinstance(x, subprocess.TimeoutExpired) or x.returncode != 0
+    ]
+    if failed:
+        raise RuntimeError(f"{len(failed)} SLAM subprocesses failed")
 
 # %%
 if __name__ == "__main__":

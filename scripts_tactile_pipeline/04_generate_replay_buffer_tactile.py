@@ -8,6 +8,7 @@ prevents writes while flushing to disk.
 """
 import zipfile
 import os
+import sys
 import json
 import pathlib
 import click
