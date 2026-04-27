@@ -59,7 +59,7 @@ shape_meta: &shape_meta
     rotation_rep: rotation_6d
 
 task_name: &task_name xarm_pick_tube
-dataset_path: /home/zinan/Documents/zinan/data/xarm_pick_tube.zarr.zip
+dataset_path: /home/zinan/workspace/data/processed/xarm_pick_tube.zarr.zip
 pose_repr: &pose_repr
   obs_pose_repr: relative
   action_pose_repr: relative
