@@ -1,6 +1,9 @@
 from typing import Optional, Callable, Dict
 import enum
 import time
+import os
+import re
+import pathlib
 import cv2
 import numpy as np
 import multiprocessing as mp
@@ -16,6 +19,10 @@ class Command(enum.Enum):
     RESTART_PUT = 0
     START_RECORDING = 1
     STOP_RECORDING = 2
+
+
+OPEN_RETRY_INTERVAL_S = 0.25
+OPEN_TIMEOUT_S = 8.0
 
 class UvcCamera(mp.Process):
     """
@@ -34,6 +41,7 @@ class UvcCamera(mp.Process):
             dev_video_path,
             resolution=(1280, 720),
             capture_fps=60,
+            fourcc=None,
             put_fps=None,
             put_downsample=True,
             get_max_k=30,
@@ -110,6 +118,7 @@ class UvcCamera(mp.Process):
         self.dev_video_path = dev_video_path
         self.resolution = resolution
         self.capture_fps = capture_fps
+        self.fourcc = fourcc
         self.put_fps = put_fps
         self.put_downsample = put_downsample
         self.receive_latency = receive_latency
@@ -157,7 +166,11 @@ class UvcCamera(mp.Process):
             self.end_wait()
 
     def start_wait(self):
-        self.ready_event.wait()
+        if not self.ready_event.wait(timeout=30):
+            raise RuntimeError(
+                f'UvcCamera[{self.dev_video_path}] not ready after 30s; '
+                f'child process likely crashed (check stderr for traceback).'
+            )
         self.video_recorder.start_wait()
     
     def end_wait(self):
@@ -200,22 +213,52 @@ class UvcCamera(mp.Process):
 
     # ========= interval API ===========
     def run(self):
-        # limit threads
-        threadpool_limits(self.num_threads)
-        cv2.setNumThreads(self.num_threads)
-
-        # open VideoCapture
-        cap = cv2.VideoCapture(self.dev_video_path, cv2.CAP_V4L2)
-        
+        import sys
+        def _log(msg):
+            print(f'[UvcCamera {self.dev_video_path}] {msg}', file=sys.stderr, flush=True)
         try:
-            # set resolution and fps
-            w, h = self.resolution
-            fps = self.capture_fps
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-            # set fps
+            _log('run() start')
+            # limit threads
+            threadpool_limits(self.num_threads)
+            _log('threadpool_limits done')
+            cv2.setNumThreads(self.num_threads)
+            _log('cv2.setNumThreads done')
+
+            dev_video_path = self._resolve_video_path(self.dev_video_path)
+            _log(f'resolved #1 -> {dev_video_path}')
+            self._wait_for_device_path(dev_video_path)
+            _log('device path present')
+            dev_video_path = self._resolve_video_path(dev_video_path)
+            _log(f'resolved #2 -> {dev_video_path}')
+            # Open device first, then configure on the same fd (GELLO-style).
+            # The previous v4l2-ctl preconfigure path closed v4l2-ctl's fd
+            # before OpenCV opened, which on some Elgato firmware leaves a
+            # window where PipeWire/wireplumber probes the device and wedges
+            # VIDIOC_DQBUF (cap.grab() blocks forever). Holding a single fd
+            # from open through STREAMON avoids the race.
+            cap = self._open_capture(dev_video_path)
+            _log(f'cap opened, isOpened={cap.isOpened()}')
+            if self.fourcc is not None:
+                if len(self.fourcc) != 4:
+                    raise ValueError('fourcc must be a four-character string')
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self.fourcc))
+            w0, h0 = self.resolution
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, w0)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h0)
+            cap.set(cv2.CAP_PROP_FPS, self.capture_fps)
+            _log(f'cap configured {self.fourcc} {w0}x{h0}@{self.capture_fps}fps')
+        except Exception:
+            import traceback
+            _log('setup failed:')
+            traceback.print_exc()
+            sys.stderr.flush()
+            raise
+
+        try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, self.cap_buffer_size)
-            cap.set(cv2.CAP_PROP_FPS, fps)
+            _log(f'cap BUF={self.cap_buffer_size}; entering warmup')
+            self._warmup_capture(cap, dev_video_path)
+            _log('warmup OK; entering frame loop')
 
             # put frequency regulation
             put_idx = None
@@ -229,13 +272,19 @@ class UvcCamera(mp.Process):
             while not self.stop_event.is_set():
                 ts = time.time()
                 ret = cap.grab()
-                assert ret
+                if not ret:
+                    raise RuntimeError(
+                        f'Failed to grab frame from video device: {dev_video_path}'
+                    )
                 
                 # directly write into shared memory to avoid copy
                 frame = self.video_recorder.get_img_buffer()
                 ret, frame = cap.retrieve(frame)
                 t_recv = time.time()
-                assert ret
+                if not ret:
+                    raise RuntimeError(
+                        f'Failed to retrieve frame from video device: {dev_video_path}'
+                    )
                 mt_cap = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
                 t_cap = mt_cap - time.monotonic() + time.time()
                 t_cal = t_recv - self.receive_latency # calibrated latency
@@ -281,6 +330,7 @@ class UvcCamera(mp.Process):
 
                 # signal ready
                 if iter_idx == 0:
+                    _log('first frame put; setting ready_event')
                     self.ready_event.set()
                     
                 # put to vis
@@ -326,8 +376,92 @@ class UvcCamera(mp.Process):
                         self.video_recorder.stop_recording()
 
                 iter_idx += 1
+        except Exception:
+            import sys, traceback
+            print(f'[UvcCamera {self.dev_video_path}] frame loop crashed:', file=sys.stderr, flush=True)
+            traceback.print_exc()
+            sys.stderr.flush()
+            raise
         finally:
             self.video_recorder.stop()
             # When everything done, release the capture
             cap.release()
 
+    def _wait_for_device_path(self, dev_video_path):
+        if not isinstance(dev_video_path, str) or not dev_video_path.startswith('/dev/'):
+            return
+        deadline = time.time() + OPEN_TIMEOUT_S
+        while time.time() < deadline:
+            resolved_path = self._resolve_video_path(dev_video_path)
+            if os.path.exists(resolved_path):
+                time.sleep(0.5)
+                return
+            time.sleep(OPEN_RETRY_INTERVAL_S)
+        raise RuntimeError(f'Timed out waiting for video device: {dev_video_path}')
+
+    def _resolve_video_path(self, dev_video_path):
+        if not isinstance(dev_video_path, str):
+            return dev_video_path
+        if os.path.exists(dev_video_path):
+            return dev_video_path
+        if not re.fullmatch(r'/dev/video\d+', dev_video_path):
+            return dev_video_path
+
+        by_id_dir = pathlib.Path('/dev/v4l/by-id')
+        if not by_id_dir.exists():
+            return dev_video_path
+
+        candidates = sorted(by_id_dir.glob('*Elgato*video-index0'))
+        if len(candidates) == 1:
+            return str(candidates[0])
+        return dev_video_path
+
+    def _open_capture(self, dev_video_path):
+        deadline = time.time() + OPEN_TIMEOUT_S
+        real_path = None
+        if isinstance(dev_video_path, str):
+            real_path = os.path.realpath(dev_video_path)
+
+        while True:
+            cap = None
+            if isinstance(dev_video_path, str):
+                cap = cv2.VideoCapture(dev_video_path, cv2.CAP_V4L2)
+                if cap.isOpened():
+                    return cap
+                cap.release()
+
+                if real_path is not None:
+                    match = re.fullmatch(r'/dev/video(\d+)', real_path)
+                    if match is not None:
+                        cap = cv2.VideoCapture(int(match.group(1)), cv2.CAP_V4L2)
+                        if cap.isOpened():
+                            return cap
+                        cap.release()
+            else:
+                cap = cv2.VideoCapture(dev_video_path, cv2.CAP_V4L2)
+                if cap.isOpened():
+                    return cap
+                cap.release()
+
+            if time.time() >= deadline:
+                break
+            time.sleep(OPEN_RETRY_INTERVAL_S)
+
+        raise RuntimeError(f'Failed to open video device: {dev_video_path}')
+
+    def _warmup_capture(self, cap, dev_video_path):
+        deadline = time.time() + OPEN_TIMEOUT_S
+        last_error = None
+        while time.time() < deadline:
+            try:
+                if not cap.grab():
+                    raise RuntimeError(f'Failed to grab frame from video device: {dev_video_path}')
+                ok, frame = cap.retrieve()
+                if not ok or frame is None:
+                    raise RuntimeError(f'Failed to retrieve frame from video device: {dev_video_path}')
+                return
+            except RuntimeError as exc:
+                last_error = exc
+                time.sleep(OPEN_RETRY_INTERVAL_S)
+        if last_error is not None:
+            raise last_error

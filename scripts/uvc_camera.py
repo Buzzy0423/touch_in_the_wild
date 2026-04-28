@@ -38,7 +38,8 @@ if usb_dev is not None:
     time.sleep(0.2)
 
 # open video0
-cap = cv2.VideoCapture('/dev/video4', cv2.CAP_V4L2)
+cap = cv2.VideoCapture('/dev/video0', cv2.CAP_V4L2)
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"NV12"))
 # set width and height
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)

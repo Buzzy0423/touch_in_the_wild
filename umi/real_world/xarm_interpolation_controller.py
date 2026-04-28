@@ -24,12 +24,13 @@ class Command(enum.Enum):
     STOP = 0
     SERVOL = 1
     SCHEDULE_WAYPOINT = 2
+    MOVEJ = 3
 
 
 class XArmInterpolationController(mp.Process):
     """
     xArm servo controller aligned with UR5 & Franka style.
-    We do NOT disconnect immediately after reading example data in the constructor.
+    xArm servo controller aligned with UR5 & Franka style.
     """
 
     def __init__(
@@ -77,32 +78,24 @@ class XArmInterpolationController(mp.Process):
         # Matching UR5 approach: keep a receive_latency variable
         self.receive_latency = receive_latency
 
-        # -------------------------------
-        # 1) Create an xArm connection ONCE, then read initial data for ring buffer
-        self.arm = XArmAPI(self.robot_ip)
-        self.arm.connect()
-        self.arm.motion_enable(enable=True)
-        self.arm.clean_error()
-        # Switch to position mode to read states
-        self.arm.set_mode(0)
-        self.arm.set_state(0)
-        time.sleep(1)
-
-        # Acquire real data for ring buffer example
-        code, actual_pose_aa = self.arm.get_position_aa(is_radian=True)
-        if code != 0 or actual_pose_aa is None:
-            actual_pose_aa = np.zeros((6,), dtype=np.float64)
-            if self.verbose:
+        # Read one snapshot to build ring buffer examples, then disconnect.
+        actual_pose_aa = np.zeros((6,), dtype=np.float64)
+        actual_q = np.zeros((7,), dtype=np.float64)
+        arm = XArmAPI(self.robot_ip)
+        try:
+            arm.connect()
+            code, pose = arm.get_position_aa(is_radian=True)
+            if code == 0 and pose is not None:
+                actual_pose_aa = np.array(pose, dtype=np.float64)
+            elif self.verbose:
                 print("[XArmPositionalController] Warning: failed to get initial pose from xArm.")
 
-        code, actual_q = self.arm.get_servo_angle(is_radian=True)
-        if code != 0 or actual_q is None:
-            actual_q = np.zeros((7,), dtype=np.float64)
-        else:
-            if len(actual_q) < 7:
-                padded_q = np.zeros(7, dtype=np.float64)
-                padded_q[:len(actual_q)] = actual_q
-                actual_q = padded_q
+            code, q = arm.get_servo_angle(is_radian=True)
+            if code == 0 and q is not None:
+                q = np.array(q, dtype=np.float64)
+                actual_q[:min(len(q), 7)] = q[:7]
+        finally:
+            arm.disconnect()
 
         # Build the ring buffer example
         example = {}
@@ -124,6 +117,7 @@ class XArmInterpolationController(mp.Process):
         example_cmd = {
             'cmd': Command.SERVOL.value,
             'target_pose': np.zeros((6,), dtype=np.float64),
+            'target_joints': np.zeros((7,), dtype=np.float64),
             'duration': 0.0,
             'target_time': 0.0
         }
@@ -208,6 +202,20 @@ class XArmInterpolationController(mp.Process):
         }
         self.input_queue.put(message)
 
+    def moveJ(self, joints):
+        assert self.is_alive()
+        joints = np.array(joints, dtype=np.float64)
+        assert joints.shape[0] >= 6
+        if joints.shape[0] < 7:
+            padded = np.zeros(7, dtype=np.float64)
+            padded[:joints.shape[0]] = joints
+            joints = padded
+        message = {
+            'cmd': Command.MOVEJ.value,
+            'target_joints': joints[:7],
+        }
+        self.input_queue.put(message)
+
     def get_state(self, k=None, out=None):
         if k is None:
             return self.ring_buffer.get(out=out)
@@ -228,7 +236,13 @@ class XArmInterpolationController(mp.Process):
 
         # Connect to xArm and initialize
         arm = XArmAPI(self.robot_ip)
+        # arm.connect()
+        print("created")
+
+        print("connecting")
         arm.connect()
+        print("connected:", arm.connected)
+        
         arm.motion_enable(enable=True)
         arm.clean_error()
 
@@ -340,6 +354,30 @@ class XArmInterpolationController(mp.Process):
                             max_rot_speed=self.max_rot_speed
                         )
                         last_waypoint_time = monotonic_target_time
+                    elif cmd == Command.MOVEJ.value:
+                        target_joints = commands['target_joints'][i]
+                        arm.set_mode(0)
+                        arm.set_state(0)
+                        code = arm.set_servo_angle(
+                            angle=target_joints,
+                            is_radian=True,
+                            wait=True,
+                        )
+                        if code != 0 and self.verbose:
+                            print(f"[XArmPositionalController] Warning: moveJ failed, code={code}")
+                        arm.set_mode(1)
+                        arm.set_state(0)
+                        code, reset_pos = arm.get_position_aa(is_radian=True)
+                        if code != 0 or reset_pos is None:
+                            reset_pos = target_pose_aa
+                        else:
+                            reset_pos = xarm_pose_mm_to_m(reset_pos)
+                        curr_t = time.monotonic()
+                        last_waypoint_time = curr_t
+                        pose_interp = PoseTrajectoryInterpolator(
+                            times=[curr_t],
+                            poses=[reset_pos]
+                        )
                     else:
                         keep_running = False
                         break

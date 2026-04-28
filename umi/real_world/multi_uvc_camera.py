@@ -17,6 +17,7 @@ class MultiUvcCamera:
             shm_manager: Optional[SharedMemoryManager]=None,
             resolution=(1280,720),
             capture_fps=60,
+            fourcc=None,
             put_fps=None,
             put_downsample=True,
             get_max_k=30,
@@ -39,6 +40,8 @@ class MultiUvcCamera:
             resolution, n_cameras, tuple)
         capture_fps = repeat_to_list(
             capture_fps, n_cameras, (int, float))
+        fourcc = repeat_to_list(
+            fourcc, n_cameras, str)
         cap_buffer_size = repeat_to_list(
             cap_buffer_size, n_cameras, int)
         transform = repeat_to_list(
@@ -57,6 +60,8 @@ class MultiUvcCamera:
                 dev_video_path=path,
                 resolution=resolution[i],
                 capture_fps=capture_fps[i],
+                # fourcc=fourcc[i],
+                fourcc="NV12",
                 put_fps=put_fps,
                 put_downsample=put_downsample,
                 get_max_k=get_max_k,

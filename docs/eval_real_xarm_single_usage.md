@@ -70,10 +70,8 @@ You should also confirm:
 Run:
 
 ```bash
-python scripts_real/eval_real_xarm_single.py \
-    -i /path/to/checkpoint.ckpt \
-    -o /path/to/output_dir \
-    --robot_ip <xarm_ip>
+python scripts_real/eval_real_xarm_single.py -i /home/zinan/Documents/zinan/data/titw_ckpts/checkpoints/epoch=0110-train_loss=0.012.ckpt -o /home/zinan/Documents/zinan/data/titw_eval --camera_path /dev/video38
+    # --camera_path /dev/v4l/by-id/usb-Elgato_Elgato_HD60_X_A00XB519234637-video-index0
 ```
 
 If your gripper is controlled through the same xArm controller, you can omit `--gripper_ip`.
@@ -83,6 +81,9 @@ The script will default to:
 - `gripper_ip = robot_ip`
 - `robot_type = xarm`
 - keyboard-only start / stop flow
+- `camera_reorder = 0`
+
+For HDMI capture devices, using an explicit `--camera_path` is recommended.
 
 ## Common Example
 
@@ -91,7 +92,7 @@ python scripts_real/eval_real_xarm_single.py \
     -i data/outputs/2026.04.22/your_run/checkpoints/latest.ckpt \
     -o data_local/xarm_eval_demo \
     --robot_ip 192.168.0.9 \
-    --camera_reorder 0 \
+    --camera_path /dev/video12 \
     --frequency 10 \
     --steps_per_inference 6
 ```
@@ -123,6 +124,9 @@ Important arguments:
   - defaults to `robot_ip`
 - `--camera_reorder`
   - camera order string, for example `0` or `021`
+- `--camera_path`
+  - explicit camera device path, for example `/dev/video12`
+  - when provided, it takes precedence over automatic camera discovery
 - `--vis_camera_idx`
   - which camera stream to show in the OpenCV window
 - `--init_joints / --no_init_joints`
@@ -216,7 +220,7 @@ python scripts_real/eval_real_xarm_single.py \
     -i /path/to/checkpoint.ckpt \
     -o data_local/xarm_eval_dryrun \
     --robot_ip 192.168.0.9 \
-    --camera_reorder 0 \
+    --camera_path /dev/video12 \
     --frequency 5 \
     --steps_per_inference 4 \
     --max_pos_speed 0.10 \

@@ -1,8 +1,7 @@
 """
 Usage:
 (umi): python scripts_real/eval_real_xarm_single.py \
-    -i /path/to/checkpoint.ckpt \
-    -o data_local/xarm_eval
+    -i /path/to/checkpoint.ckpt
 
 Single-arm xArm deployment without SpaceMouse.
 
@@ -38,12 +37,35 @@ from umi.real_world.real_inference_util import (
     get_real_umi_action,
     get_real_umi_obs_dict,
 )
+from umi.real_world.xarm_gello_util import (
+    XARM7_GELLO_START_GRIPPER,
+    XARM7_GELLO_START_JOINTS,
+)
 from umi.real_world.umi_env import UmiEnv
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+XARM_START_JOINTS = np.array(
+    [0.0, -0.6981, 0.0, 0.8727, 0.0, 1.5708, 0.0],
+    dtype=np.float64,
+)
+XARM_START_GRIPPER = 0.0
+DEFAULT_OUTPUT_ROOT = "/home/zinan/Documents/zinan/data/titw_eval"
+
+
+def make_deploy_output_dir(output_root):
+    os.makedirs(output_root, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(output_root, f"deploy_{timestamp}")
+    suffix = 1
+    while os.path.exists(output_dir):
+        output_dir = os.path.join(output_root, f"deploy_{timestamp}_{suffix}")
+        suffix += 1
+    os.makedirs(output_dir)
+    return output_dir
 
 
 def render_obs(obs, vis_camera_idx, mirror_crop):
@@ -54,6 +76,17 @@ def render_obs(obs, vis_camera_idx, mirror_crop):
     else:
         vis_img = obs[f'camera{vis_camera_idx}_rgb'][-1]
     return vis_img.copy()
+
+
+def render_preview(env, obs, vis_camera_idx, mirror_crop):
+    vis = env.camera.get_vis()['color'][vis_camera_idx]
+    if mirror_crop:
+        crop_img = obs['camera0_rgb_mirror_crop'][-1]
+        crop_img = (crop_img * 255).astype(np.uint8) if crop_img.dtype.kind == 'f' else crop_img
+        crop_img = cv2.cvtColor(crop_img, cv2.COLOR_RGB2BGR)
+        crop_img = cv2.resize(crop_img, (vis.shape[1], vis.shape[0]))
+        vis = np.concatenate([vis, crop_img], axis=1)
+    return vis.copy()
 
 
 def draw_text(vis_img, lines):
@@ -83,10 +116,13 @@ def draw_text(vis_img, lines):
 
 @click.command()
 @click.option('--input', '-i', required=True, help='Path to checkpoint')
-@click.option('--output', '-o', required=True, help='Directory to save recording')
-@click.option('--robot_ip', default='192.168.0.9', show_default=True)
+@click.option('--output', '-o', default=DEFAULT_OUTPUT_ROOT, show_default=True,
+    help='Root directory for deploy outputs. A deploy_{timestamp} subdirectory is created inside it.')
+@click.option('--robot_ip', default='192.168.1.239', show_default=True)
 @click.option('--gripper_ip', default=None, help='Defaults to robot_ip for xArm')
-@click.option('--camera_reorder', '-cr', default='021', show_default=True)
+@click.option('--camera_path', type=str, default=None,
+    help='Explicit camera device path, e.g. /dev/video12')
+@click.option('--camera_reorder', '-cr', default='0', show_default=True)
 @click.option('--vis_camera_idx', default=0, type=int, help='Which camera to visualize.')
 @click.option('--init_joints/--no_init_joints', default=True, show_default=True,
     help='Move xArm to the GELLO start_joints before enabling rollout.')
@@ -95,6 +131,10 @@ def draw_text(vis_img, lines):
 @click.option('--frequency', '-f', default=10.0, type=float, show_default=True)
 @click.option('--start_delay', default=1.0, type=float, show_default=True)
 @click.option('--auto_start', is_flag=True, default=False, help='Start one rollout immediately.')
+@click.option('--reset_before_rollout/--no_reset_before_rollout', default=True, show_default=True,
+    help='Move xArm to the GELLO start pose before each rollout.')
+@click.option('--reset_duration', default=2.0, type=float, show_default=True,
+    help='Settling duration after commanding the GELLO start pose before rollout.')
 @click.option('-nm', '--no_mirror', is_flag=True, default=False)
 @click.option('-sf', '--sim_fov', type=float, default=None)
 @click.option('-ci', '--camera_intrinsics', type=str, default=None)
@@ -102,11 +142,14 @@ def draw_text(vis_img, lines):
 @click.option('--mirror_swap', is_flag=True, default=False)
 @click.option('--max_pos_speed', default=0.25, type=float, show_default=True)
 @click.option('--max_rot_speed', default=0.6, type=float, show_default=True)
+@click.option('-uc', '--use_converter', is_flag=True, default=False,
+    help='Use training-consistent image processing (full-frame PIL BILINEAR resize, no mask, no center crop).')
 def main(
     input,
     output,
     robot_ip,
     gripper_ip,
+    camera_path,
     camera_reorder,
     vis_camera_idx,
     init_joints,
@@ -115,6 +158,8 @@ def main(
     frequency,
     start_delay,
     auto_start,
+    reset_before_rollout,
+    reset_duration,
     no_mirror,
     sim_fov,
     camera_intrinsics,
@@ -122,9 +167,27 @@ def main(
     mirror_swap,
     max_pos_speed,
     max_rot_speed,
+    use_converter,
 ):
     if gripper_ip is None:
         gripper_ip = robot_ip
+
+    output_root = output
+    output = make_deploy_output_dir(output_root)
+    print("Saving deploy output to:", output)
+
+    if init_joints:
+        assert np.allclose(XARM_START_JOINTS, XARM7_GELLO_START_JOINTS)
+        assert XARM_START_GRIPPER == XARM7_GELLO_START_GRIPPER
+        print("xArm start joints:", XARM_START_JOINTS.tolist())
+        print("xArm start gripper:", XARM_START_GRIPPER)
+
+    camera_paths = None
+    camera_reorder_list = None
+    if camera_path is not None:
+        camera_paths = [camera_path]
+    else:
+        camera_reorder_list = [int(x) for x in camera_reorder]
 
     ckpt_path = input
     if not ckpt_path.endswith('.ckpt'):
@@ -136,8 +199,28 @@ def main(
     print("model_name:", cfg.policy.obs_encoder.model_name)
     print("dataset_path:", cfg.task.dataset.dataset_path)
 
+    # Derive deployment timing from training config to match the effective
+    # observation spacing: obs_down_sample_steps / dataset_frequency.
+    # Training: 3 / 59.94 ≈ 0.05s. Deployment: camera_down_sample_steps / frequency.
+    train_obs_down = cfg.task.obs_down_sample_steps  # e.g. 3
+    train_dataset_freq = cfg.task.dataset_frequeny
+    if train_dataset_freq == 0:
+        train_dataset_freq = 59.94
+    train_effective_freq = train_dataset_freq / train_obs_down
+    # Derive camera_obs_latency from training config (or keep CLI override)
+    train_camera_latency = cfg.task.camera_obs_latency  # e.g. 0.125
+    train_robot_latency = cfg.task.robot_obs_latency
+    train_gripper_latency = cfg.task.gripper_obs_latency
+
     dt = 1 / frequency
     obs_res = get_real_obs_resolution(cfg.task.shape_meta)
+    print(f"Training: dataset_freq={train_dataset_freq}, "
+          f"obs_down_sample_steps={train_obs_down}, "
+          f"effective_freq={train_effective_freq:.1f} Hz")
+    print(f"Deployment: frequency={frequency} Hz, dt={dt:.4f}s")
+    print(f"  camera_obs_latency={train_camera_latency}, "
+          f"robot_obs_latency={train_robot_latency}, "
+          f"gripper_obs_latency={train_gripper_latency}")
 
     fisheye_converter = None
     if sim_fov is not None:
@@ -150,7 +233,10 @@ def main(
             out_fov=sim_fov
         )
 
+
+
     with SharedMemoryManager() as shm_manager:
+        # import pdb; pdb.set_trace()
         with KeystrokeCounter() as key_counter, UmiEnv(
             output_dir=output,
             robot_ip=robot_ip,
@@ -159,12 +245,15 @@ def main(
             robot_type='xarm',
             obs_image_resolution=obs_res,
             obs_float32=True,
-            camera_reorder=[int(x) for x in camera_reorder],
+            camera_reorder=camera_reorder_list,
+            camera_paths=camera_paths,
             init_joints=init_joints,
+            xarm_start_joints=XARM_START_JOINTS,
+            xarm_start_gripper=XARM_START_GRIPPER,
             enable_multi_cam_vis=True,
-            camera_obs_latency=0.17,
-            robot_obs_latency=0.0001,
-            gripper_obs_latency=0.01,
+            camera_obs_latency=train_camera_latency,
+            robot_obs_latency=train_robot_latency,
+            gripper_obs_latency=train_gripper_latency,
             robot_action_latency=0.1,
             gripper_action_latency=0.1,
             camera_obs_horizon=cfg.task.shape_meta.obs.camera0_rgb.horizon,
@@ -174,10 +263,16 @@ def main(
             fisheye_converter=fisheye_converter,
             mirror_crop=mirror_crop,
             mirror_swap=mirror_swap,
+            use_converter=use_converter,
             max_pos_speed=max_pos_speed,
             max_rot_speed=max_rot_speed,
             shm_manager=shm_manager,
         ) as env:
+            
+
+            # import pdb; pdb.set_trace()
+
+
             cv2.setNumThreads(2)
             cv2.namedWindow('default', cv2.WINDOW_NORMAL)
             print("Waiting for camera")
@@ -203,12 +298,22 @@ def main(
 
             print("Warming up policy inference")
             obs = env.get_obs()
+            # `robot0_eef_rot_axis_angle_wrt_start` (and any other *_wrt_start
+            # keys in the policy's shape_meta) are only computed when
+            # episode_start_pose is provided. For warmup we use the current
+            # pose so wrt_start ~ identity; the real start pose is recaptured
+            # at each rollout start below.
+            episode_start_pose = [np.concatenate([
+                obs['robot0_eef_pos'],
+                obs['robot0_eef_rot_axis_angle'],
+            ], axis=-1)[-1]]
             with torch.no_grad():
                 policy.reset()
                 obs_dict_np = get_real_umi_obs_dict(
                     env_obs=obs,
                     shape_meta=cfg.task.shape_meta,
                     obs_pose_repr=obs_pose_rep,
+                    episode_start_pose=episode_start_pose,
                 )
                 obs_dict = dict_apply(
                     obs_dict_np,
@@ -227,6 +332,7 @@ def main(
             print('Ready!')
             should_quit = False
             ran_auto_episode = False
+            rollout_count = 0
 
             while not should_quit:
                 print('Idle. Press "c" to start rollout, "q" to quit.')
@@ -235,14 +341,14 @@ def main(
                 while True:
                     t_cycle_end = t_idle_start + (iter_idx + 1) * dt
                     obs = env.get_obs()
-                    vis_img = render_obs(obs, vis_camera_idx, mirror_crop)
+                    vis_img = render_preview(env, obs, vis_camera_idx, mirror_crop)
                     episode_id = env.replay_buffer.n_episodes
                     draw_text(vis_img, [
                         f'Episode: {episode_id}',
                         'Mode: idle',
                         'Keys: c=start, q=quit',
                     ])
-                    cv2.imshow('default', vis_img[..., ::-1])
+                    cv2.imshow('default', vis_img)
                     _ = cv2.pollKey()
 
                     start_policy = auto_start and not ran_auto_episode
@@ -262,12 +368,25 @@ def main(
                     break
 
                 try:
+                    if rollout_count > 0:
+                        output = make_deploy_output_dir(output_root)
+                        env.set_recording_dir(output)
+                        print("Saving deploy output to:", output)
                     policy.reset()
+                    if reset_before_rollout:
+                        print("Moving to GELLO start pose before rollout.")
+                        env.move_to_start_pose(duration=reset_duration)
                     eval_t_start = time.time() + start_delay
                     rollout_t_start = time.monotonic() + start_delay
                     env.start_episode(eval_t_start)
                     frame_latency = 1 / 60
                     precise_wait(eval_t_start - frame_latency, time_func=time.time)
+                    # Capture the canonical start pose for wrt_start observations.
+                    rollout_start_obs = env.get_obs()
+                    episode_start_pose = [np.concatenate([
+                        rollout_start_obs['robot0_eef_pos'],
+                        rollout_start_obs['robot0_eef_rot_axis_angle'],
+                    ], axis=-1)[-1]]
                     print("Started rollout.")
                     iter_idx = 0
 
@@ -283,6 +402,7 @@ def main(
                                 env_obs=obs,
                                 shape_meta=cfg.task.shape_meta,
                                 obs_pose_repr=obs_pose_rep,
+                                episode_start_pose=episode_start_pose,
                             )
                             obs_dict = dict_apply(
                                 obs_dict_np,
@@ -319,13 +439,13 @@ def main(
                         )
                         print(f"Submitted {len(action)} steps of actions.")
 
-                        vis_img = render_obs(obs, vis_camera_idx, mirror_crop)
+                        vis_img = render_preview(env, obs, vis_camera_idx, mirror_crop)
                         draw_text(vis_img, [
                             f'Episode: {env.replay_buffer.n_episodes}',
                             f'Mode: rollout {time.monotonic() - rollout_t_start:.1f}s',
                             'Keys: s=stop, q=quit',
                         ])
-                        cv2.imshow('default', vis_img[..., ::-1])
+                        cv2.imshow('default', vis_img)
                         _ = cv2.pollKey()
 
                         stop_episode = False
@@ -352,6 +472,7 @@ def main(
                     env.end_episode()
                     should_quit = True
                 finally:
+                    rollout_count += 1
                     ran_auto_episode = True
 
                 if auto_start:

@@ -5,6 +5,7 @@ import time
 import shutil
 import math
 import cv2
+from PIL import Image
 from multiprocessing.managers import SharedMemoryManager
 from umi.real_world.rtde_interpolation_controller import RTDEInterpolationController
 from umi.real_world.wsg_controller import WSGController
@@ -16,6 +17,7 @@ from umi.real_world.xarm_gello_util import (
     XARM7_GELLO_START_JOINTS,
 )
 from umi.real_world.multi_uvc_camera import MultiUvcCamera, VideoRecorder
+from umi.real_world.gello_multi_uvc_camera import GelloMultiUvcCamera
 from diffusion_policy.common.timestamp_accumulator import (
     TimestampActionAccumulator,
     ObsAccumulator
@@ -34,7 +36,7 @@ from umi.common.interpolation_util import get_interp1d, PoseInterpolator
 
 
 class UmiEnv:
-    def __init__(self, 
+    def __init__(self,
             # required params
             output_dir,
             robot_ip,
@@ -48,10 +50,12 @@ class UmiEnv:
             max_obs_buffer_size=60,
             obs_float32=False,
             camera_reorder=None,
+            camera_paths=None,
             no_mirror=False,
             fisheye_converter=None,
             mirror_crop=False,
             mirror_swap=False,
+            use_converter=False,
             # timing
             align_camera_idx=0,
             # this latency compensates receive_timestamp
@@ -75,6 +79,8 @@ class UmiEnv:
             # robot
             tcp_offset=0.21,
             init_joints=False,
+            xarm_start_joints=None,
+            xarm_start_gripper=None,
             # vis params
             enable_multi_cam_vis=True,
             multi_cam_vis_resolution=(960, 960),
@@ -93,16 +99,28 @@ class UmiEnv:
             shm_manager = SharedMemoryManager()
             shm_manager.start()
 
+        self.xarm_start_joints = None
+        self.xarm_start_gripper = None
+        if xarm_start_joints is not None:
+            self.xarm_start_joints = np.asarray(xarm_start_joints, dtype=np.float64).copy()
+        if xarm_start_gripper is not None:
+            self.xarm_start_gripper = float(xarm_start_gripper)
+
         # Find and reset all Elgato capture cards.
-        # Required to workaround a firmware bug.
+        # Required to workaround a firmware bug: USBDEVFS_RESET ioctl is
+        # equivalent to a physical USB replug, clearing wedged state from
+        # a prior crashed process. Mirrors gello.cameras.uvc_camera behavior.
         reset_all_elgato_devices()
 
-        # Wait for all v4l cameras to be back online
-        time.sleep(0.1)
-        v4l_paths = get_sorted_v4l_paths()
-        if camera_reorder is not None:
-            paths = [v4l_paths[i] for i in camera_reorder]
-            v4l_paths = paths
+        # Wait for all v4l cameras to be back online after re-enumeration
+        time.sleep(2.5)
+        if camera_paths is None:
+            v4l_paths = get_sorted_v4l_paths()
+            if camera_reorder is not None:
+                paths = [v4l_paths[i] for i in camera_reorder]
+                v4l_paths = paths
+        else:
+            v4l_paths = list(camera_paths)
 
         # compute resolution for vis
         rw, rh, col, row = optimal_row_cols(
@@ -116,6 +134,7 @@ class UmiEnv:
         # Other capture card records at 720p 60fps
         resolution = list()
         capture_fps = list()
+        capture_fourcc = list()
         cap_buffer_size = list()
         video_recorder = list()
         transform = list()
@@ -124,16 +143,23 @@ class UmiEnv:
             if 'Cam_Link_4K' in path:
                 res = (3840, 2160)
                 fps = 30
+                fourcc = 'MJPG'
                 buf = 3
                 bit_rate = 6000*1000
-                def tf4k(data, input_res=res):
+                def tf4k(data, input_res=res, use_converter=use_converter):
                     img = data['color']
-                    f = get_image_transform(
-                        input_res=input_res,
-                        output_res=obs_image_resolution, 
-                        # obs output rgb
-                        bgr_to_rgb=True)
-                    img = f(img)
+                    if use_converter:
+                        img = img[..., ::-1]  # BGR to RGB
+                        img = np.array(
+                            Image.fromarray(img).resize(obs_image_resolution, Image.BILINEAR),
+                            dtype=np.uint8)
+                    else:
+                        f = get_image_transform(
+                            input_res=input_res,
+                            output_res=obs_image_resolution,
+                            # obs output rgb
+                            bgr_to_rgb=True)
+                        img = f(img)
                     if obs_float32:
                         img = img.astype(np.float32) / 255
                     data['color'] = img
@@ -142,6 +168,7 @@ class UmiEnv:
             else:
                 res = (1920, 1080)
                 fps = 60
+                fourcc = 'NV12'
                 buf = 1
                 bit_rate = 3000*1000
                 stack_crop = (idx==0) and mirror_crop
@@ -152,9 +179,17 @@ class UmiEnv:
                         mirror_mask, color=(0,0,0), mirror=False, gripper=False, finger=False)
                     is_mirror = (mirror_mask[...,0] == 0)
 
-                def tf(data, input_res=res, stack_crop=stack_crop, is_mirror=is_mirror):
+                def tf(data, input_res=res, stack_crop=stack_crop, is_mirror=is_mirror,
+                       use_converter=use_converter):
                     img = data['color']
-                    if fisheye_converter is None:
+                    if use_converter:
+                        # Match training pipeline exactly:
+                        # BGR->RGB, full-frame PIL BILINEAR resize, NO mask, NO crop
+                        img = img[..., ::-1]  # BGR to RGB
+                        img = np.array(
+                            Image.fromarray(img).resize(obs_image_resolution, Image.BILINEAR),
+                            dtype=np.uint8)
+                    elif fisheye_converter is None:
                         crop_img = None
                         if stack_crop:
                             slices = get_mirror_crop_slices(img.shape[:2], left=False)
@@ -163,13 +198,13 @@ class UmiEnv:
                             crop_img = crop_img[:,::-1,::-1] # bgr to rgb
                         f = get_image_transform(
                             input_res=input_res,
-                            output_res=obs_image_resolution, 
+                            output_res=obs_image_resolution,
                             # obs output rgb
                             bgr_to_rgb=True)
                         img = np.ascontiguousarray(f(img))
                         if is_mirror is not None:
                             img[is_mirror] = img[:,::-1,:][is_mirror]
-                        img = draw_predefined_mask(img, color=(0,0,0), 
+                        img = draw_predefined_mask(img, color=(0,0,0),
                             mirror=no_mirror, gripper=True, finger=False, use_aa=True)
                         if crop_img is not None:
                             img = np.concatenate([img, crop_img], axis=-1)
@@ -184,6 +219,7 @@ class UmiEnv:
 
             resolution.append(res)
             capture_fps.append(fps)
+            capture_fourcc.append(fourcc)
             cap_buffer_size.append(buf)
             video_recorder.append(VideoRecorder.create_hevc_nvenc(
                 fps=fps,
@@ -191,43 +227,42 @@ class UmiEnv:
                 bit_rate=bit_rate
             ))
 
-            def vis_tf(data, input_res=res):
+            def vis_tf(data, max_width=rw):
                 img = data['color']
-                f = get_image_transform(
-                    input_res=input_res,
-                    output_res=(rw,rh),
-                    bgr_to_rgb=False
-                )
-                img = f(img)
+                h, w = img.shape[:2]
+                if w > max_width:
+                    scale = max_width / float(w)
+                    img = cv2.resize(
+                        img,
+                        (int(w * scale), int(h * scale)),
+                        interpolation=cv2.INTER_AREA,
+                    )
                 data['color'] = img
                 return data
             vis_transform.append(vis_tf)
 
-        camera = MultiUvcCamera(
+        # Use GELLO's threaded UvcCamera under the hood. UMI's mp.Process-based
+        # MultiUvcCamera wedged on this Elgato hardware due to a V4L2/PipeWire
+        # race; GELLO's single-fd threaded design is the same code path that
+        # the data-collection pipeline runs against this exact camera daily.
+        # Recording (HEVC NVENC) is disabled by the adapter; the policy still
+        # runs, only post-hoc rollout video is unavailable.
+        camera = GelloMultiUvcCamera(
             dev_video_paths=v4l_paths,
-            shm_manager=shm_manager,
             resolution=resolution,
             capture_fps=capture_fps,
-            # send every frame immediately after arrival
-            # ignores put_fps
-            put_downsample=False,
+            fourcc=capture_fourcc,
             get_max_k=max_obs_buffer_size,
             receive_latency=camera_obs_latency,
-            cap_buffer_size=cap_buffer_size,
             transform=transform,
             vis_transform=vis_transform,
-            video_recorder=video_recorder,
-            verbose=False
+            verbose=False,
         )
 
+        # MultiCameraVisualizer is its own mp.Process and would re-introduce
+        # cross-process camera access against this Elgato. The eval scripts
+        # already render frames with cv2.imshow in the main loop, so skip it.
         multi_cam_vis = None
-        if enable_multi_cam_vis:
-            multi_cam_vis = MultiCameraVisualizer(
-                camera=camera,
-                row=row,
-                col=col,
-                rgb_to_bgr=False
-            )
 
         cube_diag = np.linalg.norm([1,1,1])
         j_init = np.array([0,-90,-90,-90,90,0]) / 180 * np.pi
@@ -267,7 +302,10 @@ class UmiEnv:
         elif robot_type.startswith('xarm'):
             xarm_j_init = None
             if init_joints:
-                xarm_j_init = XARM7_GELLO_START_JOINTS.copy()
+                if self.xarm_start_joints is None:
+                    xarm_j_init = XARM7_GELLO_START_JOINTS.copy()
+                else:
+                    xarm_j_init = self.xarm_start_joints.copy()
             robot = XArmInterpolationController(
                 shm_manager=shm_manager,
                 robot_ip=robot_ip,
@@ -292,7 +330,10 @@ class UmiEnv:
         if robot_type.startswith('xarm'):
             xarm_gripper_init = None
             if init_joints:
-                xarm_gripper_init = XARM7_GELLO_START_GRIPPER
+                if self.xarm_start_gripper is None:
+                    xarm_gripper_init = XARM7_GELLO_START_GRIPPER
+                else:
+                    xarm_gripper_init = self.xarm_start_gripper
             gripper = XArmGripperController(
                 shm_manager=shm_manager,
                 hostname=gripper_ip,
@@ -526,6 +567,40 @@ class UmiEnv:
     
     def get_robot_state(self):
         return self.robot.get_state()
+
+    def set_recording_dir(self, output_dir):
+        if self.obs_accumulator is not None:
+            raise RuntimeError("Cannot switch recording directory during an active episode.")
+        output_dir = pathlib.Path(output_dir)
+        assert output_dir.parent.is_dir()
+        video_dir = output_dir.joinpath('videos')
+        video_dir.mkdir(parents=True, exist_ok=True)
+        zarr_path = str(output_dir.joinpath('replay_buffer.zarr').absolute())
+        replay_buffer = ReplayBuffer.create_from_path(
+            zarr_path=zarr_path, mode='a')
+        self.output_dir = output_dir
+        self.video_dir = video_dir
+        self.replay_buffer = replay_buffer
+
+    def move_to_start_pose(self, duration=2.0, joint_tolerance=0.03):
+        assert self.is_ready
+        if self.xarm_start_joints is None:
+            raise RuntimeError("xArm start joints are not configured.")
+        gripper_start = (
+            XARM7_GELLO_START_GRIPPER
+            if self.xarm_start_gripper is None
+            else self.xarm_start_gripper
+        )
+        target_time = time.time() + float(duration)
+        self.gripper.schedule_waypoint(pos=gripper_start, target_time=target_time)
+        self.robot.moveJ(self.xarm_start_joints)
+        deadline = time.monotonic() + float(duration) + 10.0
+        while time.monotonic() < deadline:
+            q = self.robot.get_state()['ActualQ'][:self.xarm_start_joints.shape[0]]
+            if np.max(np.abs(q - self.xarm_start_joints)) <= joint_tolerance:
+                return
+            time.sleep(0.05)
+        raise RuntimeError("Timed out moving xArm to GELLO start pose.")
 
     # recording API
     def start_episode(self, start_time=None):
