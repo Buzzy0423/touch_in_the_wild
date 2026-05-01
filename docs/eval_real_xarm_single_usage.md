@@ -16,11 +16,12 @@ Facts:
 - it does not require SpaceMouse
 - it uses the single-arm `UmiEnv` path
 - xArm pose/gripper semantics have been aligned to the current GELLO training convention
+- tactile can be enabled for checkpoints that expect `camera0_tactile`
 
 Current limitations:
 
-- tactile observation is not included yet
 - the script has passed syntax checks, but hardware behavior still needs real-robot validation
+- tactile is provided to the policy online, but the current deploy replay buffer writer does not persist `camera0_tactile`
 
 ## Expected Data Semantics
 
@@ -60,10 +61,14 @@ You need all of the following before running the script:
 
 You should also confirm:
 
-- the checkpoint expects vision-only observations
+- the checkpoint expects either vision-only observations or `camera0_rgb` plus `camera0_tactile`
 - the checkpoint action dimension is `7`
   - `[pos(3), rotvec(3), gripper(1)]`
 - the checkpoint was trained on GELLO-style xArm data
+- if using tactile, both tactile serial devices are present and match the selected ports
+- if using tactile, the checkpoint tactile key is `camera0_tactile`
+
+The deploy script will refuse to run a tactile checkpoint unless `--enable_tactile` is set. It currently produces only `camera0_tactile`; other tactile key names are not supported by this script.
 
 ## Script Entry Point
 
@@ -108,6 +113,31 @@ python scripts_real/eval_real_xarm_single.py \
     --vis_camera_idx 0
 ```
 
+For a vision+tactile checkpoint:
+
+```bash
+python scripts_real/eval_real_xarm_single.py \
+    -i /path/to/vision_tactile_checkpoint.ckpt \
+    -o data_local/xarm_eval_tactile \
+    --robot_ip 192.168.1.239 \
+    --camera_path /dev/video38 \
+    --enable_tactile \
+    --tactile_left_port /dev/LeftTactile \
+    --tactile_right_port /dev/RightTactile
+```
+
+The tactile column flip is enabled by default to match `gello_software/scripts/convert_gello_to_umi_zarr.py`. To disable it:
+
+```bash
+python scripts_real/eval_real_xarm_single.py \
+    -i /path/to/vision_tactile_checkpoint.ckpt \
+    -o data_local/xarm_eval_tactile \
+    --robot_ip 192.168.1.239 \
+    --camera_path /dev/video38 \
+    --enable_tactile \
+    --no_flip_tactile_columns
+```
+
 ## Main Options
 
 Important arguments:
@@ -147,6 +177,40 @@ Important arguments:
 - `--max_rot_speed`
   - max Cartesian rotation speed limit exposed to the controller
 
+Tactile-related options:
+
+- `--enable_tactile`
+  - starts the left and right tactile serial controllers
+  - required if the checkpoint `shape_meta.obs` contains `camera0_tactile`
+  - if the checkpoint is vision-only, this can be omitted
+- `--tactile_left_port`
+  - serial device path for the left tactile sensor
+  - default: `/dev/LeftTactile`
+- `--tactile_right_port`
+  - serial device path for the right tactile sensor
+  - default: `/dev/RightTactile`
+- `--tactile_latency`
+  - latency compensation in seconds
+  - this value is subtracted from tactile receive time before timestamp alignment
+  - default: `0.06`
+- `--tactile_median_samples`
+  - number of initial tactile frames used to estimate the median baseline
+  - default: `30`
+  - keep the fingers unloaded during this baseline period
+- `--tactile_buffer_size`
+  - maximum number of tactile samples that can be requested from each tactile ring buffer
+  - default: `300`
+- `--tactile_buffer_fps`
+  - expected tactile producer frequency used to compute how many recent samples to read for alignment
+  - default: `150.0`
+  - increase this only if the tactile producer is actually faster and the buffer size is large enough
+- `--flip_tactile_columns / --no_flip_tactile_columns`
+  - default: `--flip_tactile_columns`
+  - flips each `12x32` tactile side along columns before concatenating left and right
+  - this matches the offline GELLO converter behavior:
+    `reshape(-1, 12, 32)[:, :, ::-1]`
+  - use `--no_flip_tactile_columns` only if your tactile installation or training data does not require the column flip
+
 Camera-related options:
 
 - `--mirror_crop`
@@ -163,13 +227,24 @@ The script runs in this order:
 
 1. load checkpoint
 2. infer observation resolution from `shape_meta`
-3. create `UmiEnv` with `robot_type='xarm'`
-4. initialize cameras, robot controller, and gripper controller
-5. warm up one policy inference pass
-6. enter idle mode
-7. wait for keyboard start or `--auto_start`
-8. start an episode and run rollout
-9. stop on user command or max duration
+3. detect whether `shape_meta` expects tactile
+4. optionally create tactile controllers if `--enable_tactile` is set
+5. create `UmiEnv` with `robot_type='xarm'`
+6. initialize cameras, robot controller, gripper controller, and optional tactile controllers
+7. warm up one policy inference pass
+8. enter idle mode
+9. wait for keyboard start or `--auto_start`
+10. start an episode and run rollout
+11. stop on user command or max duration
+
+When tactile is enabled, `UmiEnv.get_obs()` aligns tactile to the camera reference timeline:
+
+- the latest camera timestamp defines the reference time
+- tactile target timestamps are built backwards from that reference time
+- left and right tactile frames are selected by nearest-neighbor timestamp
+- each side is optionally flipped by columns
+- the two sides are concatenated into `camera0_tactile` with shape `(T, 12, 64)`
+- the deploy script adds the batch dimension before policy inference, producing `(B, T, 12, 64)`
 
 ## Keyboard Controls
 
@@ -195,6 +270,11 @@ Current outputs include:
 - `videos/<episode_id>/...`
 
 Each rollout started through the script becomes one recorded episode.
+
+Current note for tactile:
+
+- tactile is used for online policy inference when enabled
+- `camera0_tactile` is not currently written into the deploy replay buffer by `UmiEnv.end_episode()`
 
 ## What Changed Relative to Older xArm Deploy Code
 
@@ -247,22 +327,28 @@ During the first rollout, specifically verify:
 
 Known facts:
 
-- this path is currently vision-only
-- tactile-enabled checkpoints are not wired into this script yet
+- this path supports vision-only checkpoints and checkpoints expecting `camera0_tactile`
+- tactile support requires both left and right tactile serial devices
+- tactile is aligned online using nearest-neighbor timestamps against the camera reference timeline
 - xArm default init joints come from the GELLO HDMI config listed above
 
 Assumptions that still need validation on hardware:
 
 - current speed defaults are appropriate for your robot setup
 - current latency settings are acceptable for your cameras and controller
+- `--tactile_latency 0.06` is acceptable for your tactile hardware
+- `--flip_tactile_columns` matches your tactile installation and training data
 - the checkpoint action range is physically safe for your workspace
 
 ## Related Files
 
 - `scripts_real/eval_real_xarm_single.py`
 - `umi/real_world/umi_env.py`
+- `umi/real_world/tactile_controller_left.py`
+- `umi/real_world/tactile_controller_right.py`
 - `umi/real_world/xarm_gello_util.py`
 - `umi/real_world/xarm_interpolation_controller.py`
 - `umi/real_world/xarm_gripper_controller.py`
+- `/home/zinan/Documents/zinan/gello_software/scripts/convert_gello_to_umi_zarr.py`
 - `docs/gello_data_vs_deploy.md`
 - `docs/plan_single_arm_xarm_deploy.md`

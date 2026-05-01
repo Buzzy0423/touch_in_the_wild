@@ -5,6 +5,7 @@ data_local
 data_workspace
 outputs
 wandb
+debug
 **/.DS_Store
 *.lprof
 

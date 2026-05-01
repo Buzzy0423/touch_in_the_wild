@@ -41,6 +41,8 @@ from umi.real_world.xarm_gello_util import (
     XARM7_GELLO_START_GRIPPER,
     XARM7_GELLO_START_JOINTS,
 )
+from umi.real_world.tactile_controller_left import TactileControllerLeft
+from umi.real_world.tactile_controller_right import TactileControllerRight
 from umi.real_world.umi_env import UmiEnv
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
@@ -76,6 +78,49 @@ def render_obs(obs, vis_camera_idx, mirror_crop):
     else:
         vis_img = obs[f'camera{vis_camera_idx}_rgb'][-1]
     return vis_img.copy()
+
+
+def render_tactile(tactile_left, tactile_right):
+    if tactile_left is None or tactile_right is None:
+        return None
+    left_data = tactile_left.get(k=1)
+    right_data = tactile_right.get(k=1)
+    if left_data is None or right_data is None:
+        return None
+    left_frame = left_data['frame'][-1]
+    right_frame = right_data['frame'][-1]
+    scale = 10
+    left_vis_u8 = np.clip(left_frame * 255.0, 0, 255).astype(np.uint8)
+    right_vis_u8 = np.clip(right_frame * 255.0, 0, 255).astype(np.uint8)
+    left_color = cv2.applyColorMap(left_vis_u8, cv2.COLORMAP_VIRIDIS)
+    right_color = cv2.applyColorMap(right_vis_u8, cv2.COLORMAP_VIRIDIS)
+    h, w = left_color.shape[:2]
+    left_big = cv2.resize(left_color, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
+    right_big = cv2.resize(right_color, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
+    cv2.putText(left_big, "LEFT", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(right_big, "RIGHT", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    gap = np.zeros((left_big.shape[0], 20, 3), dtype=np.uint8)
+    return np.concatenate([left_big, gap, right_big], axis=1)
+
+
+def recalibrate_tactile(tactile_left, tactile_right, timeout):
+    if tactile_left is None or tactile_right is None:
+        return True
+
+    print("[Tactile] Resetting baseline before rollout...")
+    tactile_left.reset_baseline()
+    tactile_right.reset_baseline()
+
+    print(f"[Tactile] Waiting for baseline calibration (up to {timeout:.1f}s)...")
+    deadline = time.monotonic() + timeout
+    left_ok = tactile_left.wait_until_calibrated(timeout=max(0.0, deadline - time.monotonic()))
+    right_ok = tactile_right.wait_until_calibrated(timeout=max(0.0, deadline - time.monotonic()))
+    if left_ok and right_ok:
+        print("[Tactile] Baseline calibration complete.")
+        return True
+
+    print(f"[Tactile] Baseline calibration timeout. Status: left={left_ok}, right={right_ok}")
+    return False
 
 
 def render_preview(env, obs, vis_camera_idx, mirror_crop):
@@ -127,7 +172,7 @@ def draw_text(vis_img, lines):
 @click.option('--init_joints/--no_init_joints', default=True, show_default=True,
     help='Move xArm to the GELLO start_joints before enabling rollout.')
 @click.option('--steps_per_inference', '-si', default=6, type=int, show_default=True)
-@click.option('--max_duration', '-md', default=60.0, type=float, show_default=True)
+@click.option('--max_duration', '-md', default=120.0, type=float, show_default=True)
 @click.option('--frequency', '-f', default=10.0, type=float, show_default=True)
 @click.option('--start_delay', default=1.0, type=float, show_default=True)
 @click.option('--auto_start', is_flag=True, default=False, help='Start one rollout immediately.')
@@ -143,7 +188,21 @@ def draw_text(vis_img, lines):
 @click.option('--max_pos_speed', default=0.25, type=float, show_default=True)
 @click.option('--max_rot_speed', default=0.6, type=float, show_default=True)
 @click.option('-uc', '--use_converter', is_flag=True, default=False,
-    help='Use training-consistent image processing (full-frame PIL BILINEAR resize, no mask, no center crop).')
+    help='Use legacy converter image processing (full-frame PIL BILINEAR resize, no mask, no center crop).')
+@click.option('--enable_tactile', is_flag=True, default=False,
+    help='Enable left/right tactile serial controllers and provide camera0_tactile to the policy.')
+@click.option('--tactile_left_port', default='/dev/LeftTactile', show_default=True)
+@click.option('--tactile_right_port', default='/dev/RightTactile', show_default=True)
+@click.option('--tactile_latency', default=0.06, type=float, show_default=True,
+    help='Seconds subtracted from tactile receive time for timestamp alignment.')
+@click.option('--tactile_median_samples', default=30, type=int, show_default=True)
+@click.option('--tactile_buffer_size', default=300, type=int, show_default=True)
+@click.option('--tactile_buffer_fps', default=150.0, type=float, show_default=True,
+    help='Expected tactile producer frequency used to choose how many recent samples to read.')
+@click.option('--flip_tactile_columns/--no_flip_tactile_columns', default=True, show_default=True,
+    help='Flip each 12x32 tactile side along columns before concatenating, matching GELLO zarr conversion.')
+@click.option('--tactile_recalibration_timeout', default=20.0, type=float, show_default=True,
+    help='Seconds to wait for tactile baseline recalibration before each rollout.')
 def main(
     input,
     output,
@@ -168,6 +227,15 @@ def main(
     max_pos_speed,
     max_rot_speed,
     use_converter,
+    enable_tactile,
+    tactile_left_port,
+    tactile_right_port,
+    tactile_latency,
+    tactile_median_samples,
+    tactile_buffer_size,
+    tactile_buffer_fps,
+    flip_tactile_columns,
+    tactile_recalibration_timeout,
 ):
     if gripper_ip is None:
         gripper_ip = robot_ip
@@ -198,6 +266,22 @@ def main(
     cfg = payload['cfg']
     print("model_name:", cfg.policy.obs_encoder.model_name)
     print("dataset_path:", cfg.task.dataset.dataset_path)
+    tactile_keys = [
+        key for key, attr in cfg.task.shape_meta.obs.items()
+        if attr.get('type', 'low_dim') == 'tactile'
+    ]
+    if tactile_keys and tactile_keys != ['camera0_tactile']:
+        raise RuntimeError(
+            "xArm tactile deploy currently produces only camera0_tactile, "
+            f"but checkpoint expects {tactile_keys}."
+        )
+    if tactile_keys and not enable_tactile:
+        raise RuntimeError(
+            "Checkpoint expects tactile observations "
+            f"{tactile_keys}, but --enable_tactile was not set."
+        )
+    if enable_tactile and not tactile_keys:
+        print("Tactile enabled, but checkpoint shape_meta has no tactile observation key.")
 
     # Derive deployment timing from training config to match the effective
     # observation spacing: obs_down_sample_steps / dataset_frequency.
@@ -235,7 +319,38 @@ def main(
 
 
 
+    tactile_obs_horizon = cfg.task.shape_meta.obs.camera0_rgb.horizon
+    tactile_down_sample_steps = cfg.task.obs_down_sample_steps
+    if tactile_keys:
+        tactile_meta = cfg.task.shape_meta.obs[tactile_keys[0]]
+        tactile_obs_horizon = tactile_meta.horizon
+        tactile_down_sample_steps = tactile_meta.get(
+            'down_sample_steps',
+            cfg.task.obs_down_sample_steps,
+        )
+
     with SharedMemoryManager() as shm_manager:
+        tactile_left = None
+        tactile_right = None
+        if enable_tactile:
+            print("Starting tactile controllers:")
+            print("  left:", tactile_left_port)
+            print("  right:", tactile_right_port)
+            print("  flip columns:", flip_tactile_columns)
+            tactile_left = TactileControllerLeft(
+                shm_manager=shm_manager,
+                port_left=tactile_left_port,
+                median_samples=tactile_median_samples,
+                ring_buffer_size=tactile_buffer_size,
+                receive_latency=tactile_latency,
+            )
+            tactile_right = TactileControllerRight(
+                shm_manager=shm_manager,
+                port_right=tactile_right_port,
+                median_samples=tactile_median_samples,
+                ring_buffer_size=tactile_buffer_size,
+                receive_latency=tactile_latency,
+            )
         # import pdb; pdb.set_trace()
         with KeystrokeCounter() as key_counter, UmiEnv(
             output_dir=output,
@@ -259,6 +374,10 @@ def main(
             camera_obs_horizon=cfg.task.shape_meta.obs.camera0_rgb.horizon,
             robot_obs_horizon=cfg.task.shape_meta.obs.robot0_eef_pos.horizon,
             gripper_obs_horizon=cfg.task.shape_meta.obs.robot0_gripper_width.horizon,
+            tactile_obs_horizon=tactile_obs_horizon,
+            tactile_down_sample_steps=tactile_down_sample_steps,
+            tactile_buffer_fps=tactile_buffer_fps,
+            flip_tactile_columns=flip_tactile_columns,
             no_mirror=no_mirror,
             fisheye_converter=fisheye_converter,
             mirror_crop=mirror_crop,
@@ -266,6 +385,8 @@ def main(
             use_converter=use_converter,
             max_pos_speed=max_pos_speed,
             max_rot_speed=max_rot_speed,
+            tactile_controller_left=tactile_left,
+            tactile_controller_right=tactile_right,
             shm_manager=shm_manager,
         ) as env:
             
@@ -275,8 +396,10 @@ def main(
 
             cv2.setNumThreads(2)
             cv2.namedWindow('default', cv2.WINDOW_NORMAL)
-            print("Waiting for camera")
-            time.sleep(1.0)
+            if enable_tactile:
+                cv2.namedWindow('tactile', cv2.WINDOW_NORMAL)
+            print("Waiting for camera/tactile" if enable_tactile else "Waiting for camera")
+            time.sleep(2.0 if enable_tactile else 1.0)
 
             cls = hydra.utils.get_class(cfg._target_)
             workspace = cls(cfg)
@@ -332,10 +455,9 @@ def main(
             print('Ready!')
             should_quit = False
             ran_auto_episode = False
-            rollout_count = 0
 
             while not should_quit:
-                print('Idle. Press "c" to start rollout, "q" to quit.')
+                print('Idle. Press "c" to start rollout, "s" to stop (during rollout), "q" to quit.')
                 t_idle_start = time.monotonic()
                 iter_idx = 0
                 while True:
@@ -346,9 +468,13 @@ def main(
                     draw_text(vis_img, [
                         f'Episode: {episode_id}',
                         'Mode: idle',
-                        'Keys: c=start, q=quit',
+                        'Keys: c=start, s=stop (during rollout), q=quit',
                     ])
                     cv2.imshow('default', vis_img)
+                    if enable_tactile:
+                        tactile_vis = render_tactile(env.tactile_left, env.tactile_right)
+                        if tactile_vis is not None:
+                            cv2.imshow('tactile', tactile_vis)
                     _ = cv2.pollKey()
 
                     start_policy = auto_start and not ran_auto_episode
@@ -368,14 +494,16 @@ def main(
                     break
 
                 try:
-                    if rollout_count > 0:
-                        output = make_deploy_output_dir(output_root)
-                        env.set_recording_dir(output)
-                        print("Saving deploy output to:", output)
                     policy.reset()
                     if reset_before_rollout:
                         print("Moving to GELLO start pose before rollout.")
                         env.move_to_start_pose(duration=reset_duration)
+                    if enable_tactile:
+                        recalibrate_tactile(
+                            env.tactile_left,
+                            env.tactile_right,
+                            tactile_recalibration_timeout,
+                        )
                     eval_t_start = time.time() + start_delay
                     rollout_t_start = time.monotonic() + start_delay
                     env.start_episode(eval_t_start)
@@ -446,6 +574,10 @@ def main(
                             'Keys: s=stop, q=quit',
                         ])
                         cv2.imshow('default', vis_img)
+                        if enable_tactile:
+                            tactile_vis = render_tactile(env.tactile_left, env.tactile_right)
+                            if tactile_vis is not None:
+                                cv2.imshow('tactile', tactile_vis)
                         _ = cv2.pollKey()
 
                         stop_episode = False
@@ -472,7 +604,6 @@ def main(
                     env.end_episode()
                     should_quit = True
                 finally:
-                    rollout_count += 1
                     ran_auto_episode = True
 
                 if auto_start:

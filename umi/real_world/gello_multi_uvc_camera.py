@@ -10,6 +10,8 @@ probe the device, leaving ``VIDIOC_DQBUF`` wedged on the first
 -- it is the same camera class the data-collection pipeline runs against
 this exact hardware every day.
 """
+import os
+import subprocess
 from typing import Dict, List, Optional, Sequence
 
 import cv2
@@ -49,7 +51,7 @@ class GelloMultiUvcCamera:
         self._cameras: List[Optional[GelloUvcCamera]] = [None] * n
         self._started: bool = False
         self._verbose: bool = bool(verbose)
-        self._video_writers: List[Optional[cv2.VideoWriter]] = []
+        self._video_writers: List[Optional[subprocess.Popen]] = []
         self._last_written_ts: List[float] = [0.0] * n
 
     @property
@@ -134,10 +136,13 @@ class GelloMultiUvcCamera:
                 # Write raw frame to video if recording is active
                 if (self._video_writers and idx < len(self._video_writers)
                         and self._video_writers[idx] is not None
-                        and self._video_writers[idx].isOpened()
+                        and self._video_writers[idx].stdin is not None
                         and frame_ts > self._last_written_ts[idx]):
-                    self._video_writers[idx].write(bgr_frame)
-                    self._last_written_ts[idx] = frame_ts
+                    try:
+                        self._video_writers[idx].stdin.write(bgr_frame.tobytes())
+                        self._last_written_ts[idx] = frame_ts
+                    except BrokenPipeError:
+                        pass
                 data = {
                     "color": bgr_frame,
                     "timestamp": frame_ts,
@@ -176,7 +181,7 @@ class GelloMultiUvcCamera:
             per_cam.append(data["color"])
         return {"color": np.stack(per_cam, axis=0)}
 
-    # --- recording via cv2.VideoWriter ---
+    # --- recording via ffmpeg subprocess pipes ---
 
     def start_recording(self, video_path: List[str], start_time: Optional[float] = None) -> None:
         self._video_writers = []
@@ -184,18 +189,53 @@ class GelloMultiUvcCamera:
         for idx in range(self.n_cameras):
             cam = self._cameras[idx]
             res_w, res_h = cam._resolution
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             fps = cam._fps
-            writer = cv2.VideoWriter(video_path[idx], fourcc, fps, (res_w, res_h))
-            if not writer.isOpened():
-                print(f"[GelloMultiUvcCamera] WARNING: failed to open VideoWriter "
-                      f"for camera {idx} at {video_path[idx]}")
-            self._video_writers.append(writer)
+            cmd = [
+                'ffmpeg',
+                '-y',
+                '-f', 'rawvideo',
+                '-vcodec', 'rawvideo',
+                '-s', f'{res_w}x{res_h}',
+                '-pix_fmt', 'bgr24',
+                '-r', str(fps),
+                '-i', '-',
+                '-c:v', 'libx264',
+                '-preset', 'fast',
+                '-crf', '23',
+                '-pix_fmt', 'yuv420p',
+                '-movflags', '+faststart',
+                video_path[idx],
+            ]
+            proc = None
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                print(f"[GelloMultiUvcCamera] camera {idx} recording to "
+                      f"{video_path[idx]} ({res_w}x{res_h} @ {fps}fps, libx264)")
+            except FileNotFoundError:
+                print(f"[GelloMultiUvcCamera] WARNING: ffmpeg not found, "
+                      f"cannot record camera {idx}")
+            except Exception as e:
+                print(f"[GelloMultiUvcCamera] WARNING: failed to start ffmpeg "
+                      f"for camera {idx}: {e}")
+            self._video_writers.append(proc)
 
     def stop_recording(self) -> None:
         for writer in self._video_writers:
-            if writer is not None and writer.isOpened():
-                writer.release()
+            if writer is not None and writer.stdin is not None:
+                try:
+                    writer.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    writer.wait(timeout=10)
+                except Exception:
+                    writer.kill()
+                    writer.wait()
         self._video_writers.clear()
 
     def restart_put(self, start_time: Optional[float] = None) -> None:

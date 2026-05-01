@@ -24,15 +24,75 @@ from diffusion_policy.common.timestamp_accumulator import (
 )
 from umi.common.cv_util import (
     draw_predefined_mask, 
-    get_mirror_crop_slices
+    get_mirror_crop_slices,
+    inpaint_tag,
 )
 from umi.real_world.multi_camera_visualizer import MultiCameraVisualizer
 from diffusion_policy.common.replay_buffer import ReplayBuffer
-from diffusion_policy.common.cv2_util import (
-    get_image_transform, optimal_row_cols)
+from diffusion_policy.common.cv2_util import optimal_row_cols
 from umi.common.usb_util import reset_all_elgato_devices, get_sorted_v4l_paths
 from umi.common.pose_util import pose_to_pos_rot
 from umi.common.interpolation_util import get_interp1d, PoseInterpolator
+
+
+def _get_training_image_transform(input_res, output_res):
+    iw, ih = input_res
+    ow, oh = output_res
+    crop_h = ih
+    crop_w = round(ih / oh * ow)
+
+    w_slice_start = (iw - crop_w) // 2
+    w_slice = slice(w_slice_start, w_slice_start + crop_w)
+    h_slice_start = (ih - crop_h) // 2
+    h_slice = slice(h_slice_start, h_slice_start + crop_h)
+
+    def transform(img):
+        if img.shape != (ih, iw, 3):
+            raise ValueError(f"Expected RGB frame shape {(ih, iw, 3)}, got {img.shape}")
+        img = img[h_slice, w_slice]
+        return cv2.resize(img, output_res, interpolation=cv2.INTER_AREA)
+
+    return transform
+
+
+def _get_aruco_corner_detector(aruco_dict_name="DICT_4X4_50"):
+    aruco_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, aruco_dict_name))
+    params = cv2.aruco.DetectorParameters()
+
+    if hasattr(cv2.aruco, "ArucoDetector"):
+        detector = cv2.aruco.ArucoDetector(aruco_dict, params)
+
+        def detect(gray):
+            corners, _, _ = detector.detectMarkers(gray)
+            return corners
+
+        return detect
+
+    def detect(gray):
+        corners, _, _ = cv2.aruco.detectMarkers(
+            image=gray,
+            dictionary=aruco_dict,
+            parameters=params,
+        )
+        return corners
+
+    return detect
+
+
+def _apply_training_rgb_processing(
+        img_bgr,
+        resize_tf,
+        detect_aruco_corners,
+        mask_w=320,
+        mask_h=160):
+    img = np.ascontiguousarray(img_bgr[..., ::-1])
+    if mask_w > 0 and mask_h > 0:
+        img[:mask_h, :mask_w] = 0
+        img[:mask_h, -mask_w:] = 0
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    for corners in detect_aruco_corners(gray):
+        img = inpaint_tag(img, np.asarray(corners).reshape(-1, 2))
+    return resize_tf(img)
 
 
 class UmiEnv:
@@ -69,10 +129,14 @@ class UmiEnv:
             camera_down_sample_steps=1,
             robot_down_sample_steps=1,
             gripper_down_sample_steps=1,
+            tactile_down_sample_steps=1,
             # all in steps (relative to frequency)
             camera_obs_horizon=2,
             robot_obs_horizon=2,
             gripper_obs_horizon=2,
+            tactile_obs_horizon=None,
+            tactile_buffer_fps=150,
+            flip_tactile_columns=False,
             # action
             max_pos_speed=0.25,
             max_rot_speed=0.6,
@@ -84,6 +148,8 @@ class UmiEnv:
             # vis params
             enable_multi_cam_vis=True,
             multi_cam_vis_resolution=(960, 960),
+            tactile_controller_left=None,
+            tactile_controller_right=None,
             # shared memory
             shm_manager=None
             ):
@@ -139,6 +205,7 @@ class UmiEnv:
         video_recorder = list()
         transform = list()
         vis_transform = list()
+        detect_aruco_corners = _get_aruco_corner_detector()
         for idx, path in enumerate(v4l_paths):
             if 'Cam_Link_4K' in path:
                 res = (3840, 2160)
@@ -146,7 +213,11 @@ class UmiEnv:
                 fourcc = 'MJPG'
                 buf = 3
                 bit_rate = 6000*1000
-                def tf4k(data, input_res=res, use_converter=use_converter):
+                resize_tf = _get_training_image_transform(
+                    input_res=res,
+                    output_res=obs_image_resolution,
+                )
+                def tf4k(data, resize_tf=resize_tf, use_converter=use_converter):
                     img = data['color']
                     if use_converter:
                         img = img[..., ::-1]  # BGR to RGB
@@ -154,12 +225,11 @@ class UmiEnv:
                             Image.fromarray(img).resize(obs_image_resolution, Image.BILINEAR),
                             dtype=np.uint8)
                     else:
-                        f = get_image_transform(
-                            input_res=input_res,
-                            output_res=obs_image_resolution,
-                            # obs output rgb
-                            bgr_to_rgb=True)
-                        img = f(img)
+                        img = _apply_training_rgb_processing(
+                            img,
+                            resize_tf=resize_tf,
+                            detect_aruco_corners=detect_aruco_corners,
+                        )
                     if obs_float32:
                         img = img.astype(np.float32) / 255
                     data['color'] = img
@@ -178,13 +248,16 @@ class UmiEnv:
                     mirror_mask = draw_predefined_mask(
                         mirror_mask, color=(0,0,0), mirror=False, gripper=False, finger=False)
                     is_mirror = (mirror_mask[...,0] == 0)
+                resize_tf = _get_training_image_transform(
+                    input_res=res,
+                    output_res=obs_image_resolution,
+                )
 
-                def tf(data, input_res=res, stack_crop=stack_crop, is_mirror=is_mirror,
-                       use_converter=use_converter):
+                def tf(data, stack_crop=stack_crop, is_mirror=is_mirror,
+                       resize_tf=resize_tf, use_converter=use_converter):
                     img = data['color']
                     if use_converter:
-                        # Match training pipeline exactly:
-                        # BGR->RGB, full-frame PIL BILINEAR resize, NO mask, NO crop
+                        # Legacy path: BGR->RGB, full-frame PIL BILINEAR resize, no mask, no crop.
                         img = img[..., ::-1]  # BGR to RGB
                         img = np.array(
                             Image.fromarray(img).resize(obs_image_resolution, Image.BILINEAR),
@@ -196,16 +269,14 @@ class UmiEnv:
                             crop = img[slices]
                             crop_img = cv2.resize(crop, obs_image_resolution)
                             crop_img = crop_img[:,::-1,::-1] # bgr to rgb
-                        f = get_image_transform(
-                            input_res=input_res,
-                            output_res=obs_image_resolution,
-                            # obs output rgb
-                            bgr_to_rgb=True)
-                        img = np.ascontiguousarray(f(img))
+                        img = _apply_training_rgb_processing(
+                            img,
+                            resize_tf=resize_tf,
+                            detect_aruco_corners=detect_aruco_corners,
+                        )
+                        img = np.ascontiguousarray(img)
                         if is_mirror is not None:
                             img[is_mirror] = img[:,::-1,:][is_mirror]
-                        img = draw_predefined_mask(img, color=(0,0,0),
-                            mirror=no_mirror, gripper=True, finger=False, use_aa=True)
                         if crop_img is not None:
                             img = np.concatenate([img, crop_img], axis=-1)
                     else:
@@ -353,6 +424,8 @@ class UmiEnv:
         self.camera = camera
         self.robot = robot
         self.gripper = gripper
+        self.tactile_left = tactile_controller_left
+        self.tactile_right = tactile_controller_right
         self.multi_cam_vis = multi_cam_vis
         self.frequency = frequency
         self.max_obs_buffer_size = max_obs_buffer_size
@@ -369,9 +442,15 @@ class UmiEnv:
         self.camera_down_sample_steps = camera_down_sample_steps
         self.robot_down_sample_steps = robot_down_sample_steps
         self.gripper_down_sample_steps = gripper_down_sample_steps
+        self.tactile_down_sample_steps = tactile_down_sample_steps
         self.camera_obs_horizon = camera_obs_horizon
         self.robot_obs_horizon = robot_obs_horizon
         self.gripper_obs_horizon = gripper_obs_horizon
+        self.tactile_obs_horizon = (
+            camera_obs_horizon if tactile_obs_horizon is None else tactile_obs_horizon
+        )
+        self.tactile_buffer_fps = tactile_buffer_fps
+        self.flip_tactile_columns = flip_tactile_columns
         # recording
         self.output_dir = output_dir
         self.video_dir = video_dir
@@ -393,6 +472,10 @@ class UmiEnv:
         self.camera.start(wait=False)
         self.gripper.start(wait=False)
         self.robot.start(wait=False)
+        if self.tactile_left is not None:
+            self.tactile_left.start()
+        if self.tactile_right is not None:
+            self.tactile_right.start()
         if self.multi_cam_vis is not None:
             self.multi_cam_vis.start(wait=False)
         if wait:
@@ -405,6 +488,10 @@ class UmiEnv:
         self.robot.stop(wait=False)
         self.gripper.stop(wait=False)
         self.camera.stop(wait=False)
+        if self.tactile_left is not None:
+            self.tactile_left.stop()
+        if self.tactile_right is not None:
+            self.tactile_right.stop()
         if wait:
             self.stop_wait()
 
@@ -501,6 +588,55 @@ class UmiEnv:
             'robot0_gripper_width': gripper_interpolator(gripper_obs_timestamps)
         }
 
+        tactile_obs = dict()
+        if (self.tactile_left is not None) and (self.tactile_right is not None):
+            tactile_obs_timestamps = last_timestamp - (
+                np.arange(self.tactile_obs_horizon)[::-1]
+                * self.tactile_down_sample_steps
+                * dt
+            )
+            k_tactile = int(np.ceil(
+                self.tactile_obs_horizon
+                * self.tactile_down_sample_steps
+                * (self.tactile_buffer_fps / self.frequency)
+            )) + 2
+
+            left_count = self.tactile_left.ring_buffer.count
+            right_count = self.tactile_right.ring_buffer.count
+            if left_count < k_tactile or right_count < k_tactile:
+                raise RuntimeError(
+                    "Not enough tactile samples for aligned observation: "
+                    f"left={left_count}, right={right_count}, need={k_tactile}"
+                )
+
+            data_left = self.tactile_left.get(k=k_tactile)
+            data_right = self.tactile_right.get(k=k_tactile)
+            ring_ts_left = data_left['timestamp']
+            ring_ts_right = data_right['timestamp']
+            ring_fr_left = data_left['frame']
+            ring_fr_right = data_right['frame']
+
+            tactile_frames = list()
+            for desired_t in tactile_obs_timestamps:
+                idx_l = np.argmin(np.abs(ring_ts_left - desired_t))
+                idx_r = np.argmin(np.abs(ring_ts_right - desired_t))
+                left_frame = ring_fr_left[idx_l]
+                right_frame = ring_fr_right[idx_r]
+                if self.flip_tactile_columns:
+                    left_frame = left_frame[:, ::-1]
+                    right_frame = right_frame[:, ::-1]
+                tactile_frames.append(
+                    np.concatenate([left_frame, right_frame], axis=-1)
+                )
+            tactile_obs['camera0_tactile'] = np.stack(tactile_frames, axis=0)
+
+            # accumulate raw tactile frames for episode recording
+            if self.obs_accumulator is not None:
+                self.obs_accumulator.put(
+                    data={'camera0_tactile': tactile_obs['camera0_tactile']},
+                    timestamps=tactile_obs_timestamps,
+                )
+
         # accumulate obs
         if self.obs_accumulator is not None:
             self.obs_accumulator.put(
@@ -522,6 +658,7 @@ class UmiEnv:
         obs_data = dict(camera_obs)
         obs_data.update(robot_obs)
         obs_data.update(gripper_obs)
+        obs_data.update(tactile_obs)
         obs_data['timestamp'] = camera_obs_timestamps
 
         return obs_data
@@ -688,6 +825,18 @@ class UmiEnv:
                     x=np.array(self.obs_accumulator.data['robot0_gripper_width'])
                 )
                 episode['robot0_gripper_width'] = gripper_interpolator(timestamps)
+
+                if 'camera0_tactile' in self.obs_accumulator.timestamps:
+                    tactile_ts = np.array(
+                        self.obs_accumulator.timestamps['camera0_tactile'])
+                    tactile_data = np.array(
+                        self.obs_accumulator.data['camera0_tactile'])
+                    tactile_frames = list()
+                    for t in timestamps:
+                        idx = np.argmin(np.abs(tactile_ts - t))
+                        tactile_frames.append(tactile_data[idx])
+                    episode['camera0_tactile'] = np.stack(
+                        tactile_frames, axis=0)
 
                 self.replay_buffer.add_episode(episode, compressors='disk')
                 episode_id = self.replay_buffer.n_episodes - 1

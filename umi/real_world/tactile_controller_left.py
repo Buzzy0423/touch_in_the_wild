@@ -15,7 +15,14 @@ def temporal_filter(new_frame, prev_frame, alpha=0.5):
     return alpha * new_frame + (1 - alpha) * prev_frame
 
 
-def readThreadLeft(serDev, ring_buffer, median_frames, is_running, receive_latency):
+def readThreadLeft(
+        serDev,
+        ring_buffer,
+        median_frames,
+        is_running,
+        receive_latency,
+        recalibrate_request,
+        calibrated_event):
     """
     Reads the left tactile sensor lines from `serDev` in 16-line blocks
     and writes the final (12x32) float array to `ring_buffer`.
@@ -79,10 +86,65 @@ def readThreadLeft(serDev, ring_buffer, median_frames, is_running, receive_laten
         data_tac = np.array(data_tac, dtype=np.float32)
         median   = np.median(data_tac, axis=0)
     flag = True
+    calibrated_event.set()
     print("Finish Left Initialization (median)")
 
     # ---- Phase 2: main loop ----
     while is_running.is_set():
+        if recalibrate_request.is_set():
+            recalibrate_request.clear()
+            calibrated_event.clear()
+            data_tac = []
+            num = 0
+            current = None
+            backup = None
+            prev_frame = np.zeros((16, 32), dtype=np.float32)
+            print("Re-calibrating Left tactile baseline...")
+            while is_running.is_set() and num < median_frames:
+                if serDev.in_waiting == 0:
+                    time.sleep(0.001)
+                    continue
+                try:
+                    line = serDev.readline().decode('utf-8').strip()
+                except:
+                    line = ""
+
+                if len(line) < 10:
+                    if current is not None and len(current) == 16:
+                        if all(len(row) == 32 for row in current):
+                            try:
+                                backup = np.array(current, dtype=np.float32)
+                                data_tac.append(backup)
+                                num += 1
+                            except ValueError:
+                                backup = None
+                                print("Skipping invalid left tactile block (ValueError).")
+                        else:
+                            print("Skipping invalid left tactile block (rows not length 32).")
+
+                    current = []
+                    continue
+
+                if current is None:
+                    current = []
+                str_values = line.split()
+                try:
+                    int_values = [int(val) for val in str_values]
+                    current.append(int_values)
+                except ValueError:
+                    continue
+
+            if len(data_tac) == 0:
+                median = np.zeros((16, 32), dtype=np.float32)
+            else:
+                data_tac = np.array(data_tac, dtype=np.float32)
+                median = np.median(data_tac, axis=0)
+            current = None
+            backup = None
+            calibrated_event.set()
+            print("Finish Left Re-calibration (median)")
+            continue
+
         if serDev.in_waiting > 0:
             try:
                 line = serDev.readline().decode('utf-8').strip()
@@ -122,7 +184,7 @@ def readThreadLeft(serDev, ring_buffer, median_frames, is_running, receive_laten
                         #print("left",final_12x32)
 
                         ring_buffer.put({
-                            "timestamp": time.time() + receive_latency,
+                            "timestamp": time.time() - receive_latency,
                             "frame": final_12x32
                         })
 
@@ -184,10 +246,20 @@ class TactileControllerLeft:
         self.receive_latency = receive_latency
         self.is_running = threading.Event()
         self.is_running.set()
+        self.recalibrate_request = threading.Event()
+        self.calibrated_event = threading.Event()
 
         self.thread_left = threading.Thread(
             target=readThreadLeft,
-            args=(self.ser_left, self.ring_buffer, self.median_samples, self.is_running, self.receive_latency),
+            args=(
+                self.ser_left,
+                self.ring_buffer,
+                self.median_samples,
+                self.is_running,
+                self.receive_latency,
+                self.recalibrate_request,
+                self.calibrated_event,
+            ),
             daemon=True
         )
 
@@ -207,3 +279,13 @@ class TactileControllerLeft:
 
     def get(self, k=1, out=None):
         return self.ring_buffer.get_last_k(k, out=out)
+
+    def reset_baseline(self):
+        self.calibrated_event.clear()
+        self.recalibrate_request.set()
+
+    def is_calibrated(self):
+        return self.calibrated_event.is_set()
+
+    def wait_until_calibrated(self, timeout=20.0):
+        return self.calibrated_event.wait(timeout=timeout)
