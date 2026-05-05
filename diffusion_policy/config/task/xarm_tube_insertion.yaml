@@ -1,4 +1,4 @@
-name: xarm_pick_tube
+name: xarm_tube_insertion
 
 camera_obs_latency: 0.125
 robot_obs_latency: 0.0001
@@ -58,8 +58,8 @@ shape_meta: &shape_meta
     down_sample_steps: ${task.obs_down_sample_steps}
     rotation_rep: rotation_6d
 
-task_name: &task_name xarm_pick_tube
-dataset_path: /home/zinan/workspace/data/processed/xarm_pick_tube.zarr.zip
+task_name: &task_name xarm_tube_insertion
+dataset_path: /home/zinan/workspace/data/processed/xarm_tube_insertion.zarr.zip
 pose_repr: &pose_repr
   obs_pose_repr: relative
   action_pose_repr: relative

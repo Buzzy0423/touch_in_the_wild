@@ -162,8 +162,12 @@ training:
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 2000
-  num_epochs: 200
+  num_epochs: 100
   gradient_accumulate_every: 1
+  mixed_precision: "bf16"  # "no", "fp16", or "bf16"
+  compile_unet: False
+  compile_mode: "default"  # "default", "reduce-overhead", or "max-autotune"
+  find_unused_parameters: False
   # EMA destroys performance when used with BatchNorm
   # replace BatchNorm with GroupNorm.
   use_ema: True
@@ -171,7 +175,7 @@ training:
   # training loop control
   # in epochs
   rollout_every: 10
-  checkpoint_every: 10
+  checkpoint_every: 5
   val_every: 1
   sample_every: 5
   # steps per epoch
@@ -192,10 +196,10 @@ logging:
 
 checkpoint:
   topk:
-    monitor_key: train_loss
+    monitor_key: val_loss_all
     mode: min
     k: 20
-    format_str: 'epoch={epoch:04d}-train_loss={train_loss:.3f}.ckpt'
+    format_str: 'epoch={epoch:04d}-val_loss_all={val_loss_all:.4f}-train_loss={train_loss:.4f}.ckpt'
   save_last_ckpt: True
   save_last_snapshot: False
 

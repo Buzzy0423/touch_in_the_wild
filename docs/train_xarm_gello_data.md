@@ -190,3 +190,68 @@ To add more demonstrations to the dataset:
 3. Merge zarr files, or re-run conversion pointing at multiple session directories
 
 The conversion script currently processes one session at a time. To combine sessions, convert each to a `.zarr` directory (not `.zarr.zip`), then write a short script that calls `replay_buffer.add_episode` from each source into a single output buffer.
+
+## 7. Sim Tactile Training
+
+When training with simulated tactile (`camera0_tactile_sim`), the vision encoder fuses RGB features with tactile features via a tactile autoencoder (MAE). The autoencoder is first trained on the target dataset's sim tactile, then the encoder half is used as a feature extractor during DP training.
+
+### 7.1 Generate Sim Tactile
+
+Use DETR model to predict tactile from RGB and append it to the dataset:
+
+```bash
+conda activate touchwild
+
+python scripts/generate_sim_tactile.py \
+    --xarm_zarr /path/to/xarm_square_insertion.zarr.zip \
+    --detr_ckpt /path/to/detr_checkpoint.pth \
+    --out_zarr /path/to/xarm_square_insertion_with_sim.zarr.zip
+```
+
+The output zarr adds a `data/camera0_tactile_sim` array alongside the original `data/camera0_tactile`.
+
+### 7.2 Task Config
+
+Task config: `diffusion_policy/config/task/xarm_square_insertion_sim_tactile.yaml`
+
+Key differences from the no-tactile config:
+
+| Setting | `xarm_square_insertion.yaml` | `xarm_square_insertion_sim_tactile.yaml` |
+|---|---|---|
+| `obs_down_sample_steps` | 3 | 3 |
+| `camera0_tactile_sim` | absent | `shape: [12, 64]`, `type: tactile` |
+| `dataset_path` | original zarr | zarr with sim tactile |
+
+### 7.3 Train Tactile Autoencoder
+
+Train the tactile autoencoder (ViT-Base CLIP + cross-attention + CNN) on the sim-tactile dataset:
+
+```bash
+python pretrain_mae/pretrain_mae.py \
+    --config-name pretrain_mae_finetune_sim
+```
+
+Config: `diffusion_policy/config/pretrain_mae_finetune_sim.yaml`
+- `training.train_ratio: 1.0` — use all episodes
+- `training.val_ratio: 0.0` — no validation split
+- `training.num_epochs: 10` — fewer epochs since it's a single-task dataset
+- No `task:` override — uses the task config's `dataset_path` directly
+
+Checkpoints are saved to `pretrain_checkpoints/checkpoint_<dataset>_<timestamp>/`.
+
+### 7.4 Train Diffusion Policy with Sim Tactile
+
+After the autoencoder is trained, point `pretrain_ckpt_path` to the new checkpoint:
+
+```bash
+python train.py \
+    --config-name train_diffusion_unet_timm_umi_workspace \
+    task=xarm_square_insertion_sim_tactile \
+    policy.obs_encoder.pretrain_ckpt_path=pretrain_checkpoints/checkpoint_<dataset>_<ts>/epoch_0009.pth \
+    training.n_train_episodes=null
+```
+
+The `use_tactile: true` and `tactile_model_choice: "pretrain"` are already set in the training config. The `TimmObsEncoder` will:
+1. Route `camera0_tactile_sim` through the trained autoencoder encoder
+2. Cross-attend tactile tokens with ViT image tokens
+3. Produce a fused RGB+tactile feature vector as global conditioning for the UNet

@@ -138,7 +138,7 @@ class SequenceSampler:
                 assert this_latency_steps == 0
                 num_valid = min(this_horizon, (current_idx - start_idx) // this_downsample_steps + 1)
                 slice_start = current_idx - (num_valid - 1) * this_downsample_steps
-
+                #print(f"key={key}, slice_start={slice_start}, current_idx={current_idx}, this_downsample_steps={this_downsample_steps}, input_arr.shape={input_arr.shape}, input_arr.chunks={input_arr.chunks}")
                 output = input_arr[slice_start: current_idx + 1: this_downsample_steps]
                 assert output.shape[0] == num_valid
                 

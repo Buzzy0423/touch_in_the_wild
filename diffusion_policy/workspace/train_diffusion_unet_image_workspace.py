@@ -184,18 +184,50 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         if not cfg.training.resume:
             self.exclude_keys = ['optimizer']
 
+    def _maybe_compile_unet(self, cfg, accelerator):
+        if not cfg.training.get('compile_unet', False):
+            return
+        if not hasattr(torch, 'compile'):
+            accelerator.print('[Workspace] torch.compile is not available; skipping UNet compile.')
+            return
+
+        compile_mode = cfg.training.get('compile_mode', 'default')
+        compile_kwargs = dict()
+        if compile_mode not in (None, 'default'):
+            compile_kwargs['mode'] = compile_mode
+
+        accelerator.print(f'[Workspace] Compiling diffusion UNet with torch.compile({compile_kwargs}).')
+        self.model.model = torch.compile(self.model.model, **compile_kwargs)
+
+    def _swap_to_uncompiled_unet(self, model):
+        compiled_unet = getattr(model, 'model', None)
+        original_unet = getattr(compiled_unet, '_orig_mod', None)
+        if original_unet is not None:
+            model.model = original_unet
+        return compiled_unet, original_unet
+
+    def _restore_compiled_unet(self, model, compiled_unet, original_unet):
+        if original_unet is not None:
+            model.model = compiled_unet
+
     def run(self):
         cfg = copy.deepcopy(self.cfg)
 
         from accelerate.utils import DistributedDataParallelKwargs
 
-        # tell DDP to allow unused parameters
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        # control whether DDP should scan for unused parameters every iteration
+        ddp_kwargs = DistributedDataParallelKwargs(
+            find_unused_parameters=cfg.training.get('find_unused_parameters', False)
+        )
 
         # pass that into the Accelerator
+        mixed_precision = cfg.training.get('mixed_precision', 'no')
+        if mixed_precision in (None, 'none'):
+            mixed_precision = 'no'
         accelerator = Accelerator(
             log_with='wandb',
             kwargs_handlers=[ddp_kwargs],
+            mixed_precision=mixed_precision,
         )
 
         wandb_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
@@ -251,6 +283,8 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
             self.ema_model.set_normalizer(normalizer)
+
+        self._maybe_compile_unet(cfg, accelerator)
 
         # configure lr scheduler
         lr_scheduler = get_scheduler(
@@ -349,7 +383,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         # compute loss
                         raw_loss = self.model(batch)
                         loss = raw_loss / cfg.training.gradient_accumulate_every
-                        loss.backward()
+                        accelerator.backward(loss)
 
                         # step optimizer
                         if self.global_step % cfg.training.gradient_accumulate_every == 0:
@@ -359,7 +393,12 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         
                         # update ema
                         if cfg.training.use_ema:
-                            ema.step(accelerator.unwrap_model(self.model))
+                            unwrapped_model = accelerator.unwrap_model(self.model)
+                            compiled_unet, original_unet = self._swap_to_uncompiled_unet(unwrapped_model)
+                            try:
+                                ema.step(unwrapped_model)
+                            finally:
+                                self._restore_compiled_unet(unwrapped_model, compiled_unet, original_unet)
 
                         # logging
                         raw_loss_cpu = raw_loss.item()
@@ -459,26 +498,30 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     # unwrap the model to save ckpt
                     model_ddp = self.model
                     self.model = accelerator.unwrap_model(self.model)
+                    compiled_unet, original_unet = self._swap_to_uncompiled_unet(self.model)
 
                     # checkpointing
-                    if cfg.checkpoint.save_last_ckpt:
-                        self.save_checkpoint()
-                    if cfg.checkpoint.save_last_snapshot:
-                        self.save_snapshot()
+                    try:
+                        if cfg.checkpoint.save_last_ckpt:
+                            self.save_checkpoint()
+                        if cfg.checkpoint.save_last_snapshot:
+                            self.save_snapshot()
 
-                    # sanitize metric names
-                    metric_dict = dict()
-                    for key, value in step_log.items():
-                        new_key = key.replace('/', '_')
-                        metric_dict[new_key] = value
-                    
-                    # We can't copy the last checkpoint here
-                    # since save_checkpoint uses threads.
-                    # therefore at this point the file might have been empty!
-                    topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                        # sanitize metric names
+                        metric_dict = dict()
+                        for key, value in step_log.items():
+                            new_key = key.replace('/', '_')
+                            metric_dict[new_key] = value
+                        
+                        # We can't copy the last checkpoint here
+                        # since save_checkpoint uses threads.
+                        # therefore at this point the file might have been empty!
+                        topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
 
-                    if topk_ckpt_path is not None:
-                        self.save_checkpoint(path=topk_ckpt_path)
+                        if topk_ckpt_path is not None:
+                            self.save_checkpoint(path=topk_ckpt_path)
+                    finally:
+                        self._restore_compiled_unet(self.model, compiled_unet, original_unet)
 
                     # recover the DDP model
                     self.model = model_ddp
