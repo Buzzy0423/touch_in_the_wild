@@ -136,7 +136,6 @@ class UmiEnv:
             gripper_obs_horizon=2,
             tactile_obs_horizon=None,
             tactile_buffer_fps=150,
-            flip_tactile_columns=False,
             # action
             max_pos_speed=0.25,
             max_rot_speed=0.6,
@@ -450,7 +449,6 @@ class UmiEnv:
             camera_obs_horizon if tactile_obs_horizon is None else tactile_obs_horizon
         )
         self.tactile_buffer_fps = tactile_buffer_fps
-        self.flip_tactile_columns = flip_tactile_columns
         # recording
         self.output_dir = output_dir
         self.video_dir = video_dir
@@ -622,9 +620,8 @@ class UmiEnv:
                 idx_r = np.argmin(np.abs(ring_ts_right - desired_t))
                 left_frame = ring_fr_left[idx_l]
                 right_frame = ring_fr_right[idx_r]
-                if self.flip_tactile_columns:
-                    left_frame = left_frame[:, ::-1]
-                    right_frame = right_frame[:, ::-1]
+                left_frame = left_frame[::-1, :]
+                right_frame = right_frame[::-1, :]
                 tactile_frames.append(
                     np.concatenate([left_frame, right_frame], axis=-1)
                 )

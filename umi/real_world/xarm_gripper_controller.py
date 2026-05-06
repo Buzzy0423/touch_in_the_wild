@@ -10,6 +10,10 @@ from umi.shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
 from umi.common.pose_trajectory_interpolator import PoseTrajectoryInterpolator
 from diffusion_policy.common.precise_sleep import precise_wait
 
+import logging
+import xarm.core.utils.log
+xarm.core.utils.log.logger.setLevel(logging.ERROR)
+
 from xarm.wrapper import XArmAPI
 from umi.real_world.xarm_gello_util import (
     XARM_SDK_GRIPPER_CLOSE,

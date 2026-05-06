@@ -17,6 +17,8 @@ Facts:
 - it uses the single-arm `UmiEnv` path
 - xArm pose/gripper semantics have been aligned to the current GELLO training convention
 - tactile can be enabled for checkpoints that expect `camera0_tactile`
+- tactile can alternatively be predicted from RGB via Tactile_Gen (`--tacgen_ckpt_path`), which is mutually exclusive with `--enable_tactile`
+- the visualization window shows real-time loop frequency (moving average of the last 10 cycles) in both idle and rollout modes
 
 Current limitations:
 
@@ -97,7 +99,7 @@ python scripts_real/eval_real_xarm_single.py \
     -i data/outputs/2026.04.22/your_run/checkpoints/latest.ckpt \
     -o data_local/xarm_eval_demo \
     --robot_ip 192.168.0.9 \
-    --camera_path /dev/video12 \
+    --camera_path /dev/video-hdmi \
     --frequency 10 \
     --steps_per_inference 6
 ```
@@ -120,23 +122,24 @@ python scripts_real/eval_real_xarm_single.py \
     -i /path/to/vision_tactile_checkpoint.ckpt \
     -o data_local/xarm_eval_tactile \
     --robot_ip 192.168.1.239 \
-    --camera_path /dev/video38 \
+    --camera_path /dev/video-hdmi \
     --enable_tactile \
     --tactile_left_port /dev/LeftTactile \
     --tactile_right_port /dev/RightTactile
 ```
 
-The tactile column flip is enabled by default to match `gello_software/scripts/convert_gello_to_umi_zarr.py`. To disable it:
+For a vision+tactile checkpoint using Tactile_Gen (simulated tactile from RGB, no hardware required):
 
 ```bash
 python scripts_real/eval_real_xarm_single.py \
     -i /path/to/vision_tactile_checkpoint.ckpt \
-    -o data_local/xarm_eval_tactile \
+    -o data_local/xarm_eval_tacgen \
     --robot_ip 192.168.1.239 \
     --camera_path /dev/video38 \
-    --enable_tactile \
-    --no_flip_tactile_columns
+    --tacgen_ckpt_path /home/zinan/Documents/zinan/Tactile_Gen/outputs/your_run/checkpoints/latest.ckpt
 ```
+
+Tactile_Gen inference only runs during rollout, not during idle. The predicted tactile is visualized in the `'tactile'` window alongside the rollout.
 
 ## Main Options
 
@@ -177,12 +180,17 @@ Important arguments:
 - `--max_rot_speed`
   - max Cartesian rotation speed limit exposed to the controller
 
-Tactile-related options:
+	- `--headless`
+	  - pure CLI mode: skip all OpenCV visualization windows
+	  - logging (print statements) and video/replay buffer saving run normally
+	  - keyboard controls (`s`/`q`) still work via pynput
+Tactile-related options (real hardware):
 
 - `--enable_tactile`
   - starts the left and right tactile serial controllers
   - required if the checkpoint `shape_meta.obs` contains `camera0_tactile`
   - if the checkpoint is vision-only, this can be omitted
+  - mutually exclusive with `--tacgen_ckpt_path`
 - `--tactile_left_port`
   - serial device path for the left tactile sensor
   - default: `/dev/LeftTactile`
@@ -204,12 +212,34 @@ Tactile-related options:
   - expected tactile producer frequency used to compute how many recent samples to read for alignment
   - default: `150.0`
   - increase this only if the tactile producer is actually faster and the buffer size is large enough
-- `--flip_tactile_columns / --no_flip_tactile_columns`
-  - default: `--flip_tactile_columns`
-  - flips each `12x32` tactile side along columns before concatenating left and right
-  - this matches the offline GELLO converter behavior:
-    `reshape(-1, 12, 32)[:, :, ::-1]`
-  - use `--no_flip_tactile_columns` only if your tactile installation or training data does not require the column flip
+
+Tactile_Gen options (simulated tactile, no hardware required):
+
+- `--tacgen_ckpt_path`
+  - path to a Tactile_Gen DETR checkpoint
+  - when set, predicted tactile from RGB replaces real tactile input
+  - mutually exclusive with `--enable_tactile`
+  - the checkpoint must match the tactile key name expected by the policy (`camera0_tactile`)
+  - Tactile_Gen inference only runs during rollout (skipped in idle mode to save GPU time)
+- `--tacgen_depth_encoder`
+  - DepthAnything encoder variant used when the Tactile_Gen checkpoint expects depth
+  - choices: `vits`, `vitb`, `vitl` (default: `vitl`)
+  - only relevant if the Tactile_Gen model has `uses_depth=True`
+- `--tacgen_depth_ckpt`
+  - path to a DepthAnything-V2 checkpoint
+  - default: `<Tactile_Gen>/third_party/Depth-Anything-V2/checkpoints/depth_anything_v2_vitl.pth`
+  - only relevant if the Tactile_Gen model has `uses_depth=True`
+- `--tacgen_mask_path`
+  - path to a fisheye mask PNG used for border suppression in Tactile_Gen's DETR attention
+  - overrides the `mask_path` stored in the checkpoint config (useful when loading a checkpoint trained on another machine)
+  - default: `<Tactile_Gen>/assets/mask.png`
+
+Tactile recalibration:
+
+- `--tactile_recalibration_timeout`
+  - seconds to wait for tactile baseline recalibration before each rollout
+  - default: `20.0`
+  - applies to both real tactile hardware and Tactile_Gen paths
 
 Camera-related options:
 
@@ -232,9 +262,9 @@ The script runs in this order:
 5. create `UmiEnv` with `robot_type='xarm'`
 6. initialize cameras, robot controller, gripper controller, and optional tactile controllers
 7. warm up one policy inference pass
-8. enter idle mode
+8. enter idle mode (real-time frequency shown in overlay)
 9. wait for keyboard start or `--auto_start`
-10. start an episode and run rollout
+10. start an episode and run rollout (real-time frequency shown in overlay)
 11. stop on user command or max duration
 
 When tactile is enabled, `UmiEnv.get_obs()` aligns tactile to the camera reference timeline:
@@ -242,7 +272,7 @@ When tactile is enabled, `UmiEnv.get_obs()` aligns tactile to the camera referen
 - the latest camera timestamp defines the reference time
 - tactile target timestamps are built backwards from that reference time
 - left and right tactile frames are selected by nearest-neighbor timestamp
-- each side is optionally flipped by columns
+- each side is flipped along rows (first row becomes last row, matching the offline GELLO converter)
 - the two sides are concatenated into `camera0_tactile` with shape `(T, 12, 64)`
 - the deploy script adds the batch dimension before policy inference, producing `(B, T, 12, 64)`
 
@@ -250,7 +280,7 @@ When tactile is enabled, `UmiEnv.get_obs()` aligns tactile to the camera referen
 
 Idle mode:
 
-- `c`: start rollout
+- `s`: start rollout
 - `q`: quit program
 
 Rollout mode:
@@ -307,7 +337,7 @@ python scripts_real/eval_real_xarm_single.py \
     --max_rot_speed 0.30
 ```
 
-Before pressing `c`, verify:
+Before pressing `s`, verify:
 
 - camera image is correct
 - observation stream is stable
@@ -337,7 +367,7 @@ Assumptions that still need validation on hardware:
 - current speed defaults are appropriate for your robot setup
 - current latency settings are acceptable for your cameras and controller
 - `--tactile_latency 0.06` is acceptable for your tactile hardware
-- `--flip_tactile_columns` matches your tactile installation and training data
+- tactile row flip matches the offline converter and your training data
 - the checkpoint action range is physically safe for your workspace
 
 ## Related Files
@@ -350,5 +380,63 @@ Assumptions that still need validation on hardware:
 - `umi/real_world/xarm_interpolation_controller.py`
 - `umi/real_world/xarm_gripper_controller.py`
 - `/home/zinan/Documents/zinan/gello_software/scripts/convert_gello_to_umi_zarr.py`
+- `scripts_real/calibrate_camera_pose.py`
 - `docs/gello_data_vs_deploy.md`
 - `docs/plan_single_arm_xarm_deploy.md`
+
+## Camera Pose Calibration
+
+If you suspect the deploy camera pose differs from the training camera pose, use the calibration script to align them:
+
+```bash
+python scripts_real/calibrate_camera_pose.py \
+    -t /home/zinan/Documents/zinan/data/gello_raw/session_20260430_164834 \
+    --camera_path /dev/video38
+```
+
+This overlays a training reference frame on the live camera feed so you can physically adjust the camera until the scene matches.
+
+Controls:
+
+| Key | Action |
+|-----|--------|
+| `o` / `p` | decrease / increase overlay opacity (0.1 steps) |
+| `m` | cycle display mode: `overlay` -> `side-by-side` -> `diff` -> `diff_split` -> `live` |
+| `n` | cycle to next reference frame (from different demos) |
+| `f` | freeze current live frame as reference |
+| `r` | restore training reference (unfreeze) |
+| `s` | save current frame to disk |
+| `q` / `ESC` | quit |
+
+Display modes:
+
+- **overlay**: training reference frame is semi-transparent on top of live feed — align edges and features until they coincide
+- **side-by-side**: live feed on left, training reference on right — compare scene composition
+- **diff**: pixel-wise absolute difference as a heatmap — red/yellow means large difference, blue means good alignment
+- **diff_split**: top half is overlay, bottom half is diff — best for fine-tuning alignment
+- **live**: live feed only, no reference
+
+Recommended workflow:
+
+1. Start in **overlay** mode at 0.5 opacity
+2. Roughly align the camera so major scene features overlap
+3. Switch to **diff** mode for precise alignment (minimize red/yellow areas)
+4. Use **diff_split** for final fine-tuning
+5. Press `s` to save a snapshot of the calibrated position for future reference
+
+
+vision
+'''bash
+python scripts_real/eval_real_xarm_single.py -i /home/zinan/Documents/zinan/data/titw_ckpts/checkpoints_0502_v/checkpoints/epoch=0030-val_loss_all=0.0208-train_loss=0.0131.ckpt -o /home/zinan/Documents/zinan/data/titw_eval --camera_path /dev/video-hdmi --headless
+'''
+
+vision-tac
+'''bash
+python scripts_real/eval_real_xarm_single.py -i /home/zinan/Documents/zinan/data/titw_ckpts/checkpoints_0501_vt/epoch=0030-train_loss=0.013.ckpt -o /home/zinan/Documents/zinan/data/titw_eval --camera_path /dev/video-hdmi --enable_tactile --headless
+'''
+
+
+vision-sim-tac
+'''bash
+python scripts_real/eval_real_xarm_single.py -i /home/zinan/Documents/zinan/data/titw_ckpts/checkpoints_0501_vt/epoch=0030-train_loss=0.013.ckpt -o /home/zinan/Documents/zinan/data/titw_eval --camera_path /dev/video-hdmi --tacgen_ckpt_path /home/zinan/Documents/zinan/data/tacgen_ckpts/0502_v16/latest.pth  --headless
+'''

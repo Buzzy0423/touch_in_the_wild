@@ -17,6 +17,10 @@ from diffusion_policy.common.pose_trajectory_interpolator import PoseTrajectoryI
 
 from diffusion_policy.common.precise_sleep import precise_wait
 
+import logging
+import xarm.core.utils.log
+xarm.core.utils.log.logger.setLevel(logging.ERROR)
+
 from xarm.wrapper import XArmAPI
 from umi.real_world.xarm_gello_util import xarm_pose_m_to_mm, xarm_pose_mm_to_m
 

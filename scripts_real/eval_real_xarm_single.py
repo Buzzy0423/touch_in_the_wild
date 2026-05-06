@@ -6,8 +6,7 @@ Usage:
 Single-arm xArm deployment without SpaceMouse.
 
 Controls:
-- Press "C" to start policy rollout.
-- Press "S" to stop the current rollout.
+- Press "S" to start policy rollout (idle) or stop the current rollout.
 - Press "Q" to quit.
 """
 import sys
@@ -31,7 +30,60 @@ from omegaconf import OmegaConf
 
 from umi.common.cv_util import parse_fisheye_intrinsics, FisheyeRectConverter
 from umi.common.precise_sleep import precise_wait
-from umi.real_world.keystroke_counter import KeystrokeCounter, KeyCode
+try:
+    from umi.real_world.keystroke_counter import KeystrokeCounter, KeyCode
+except ImportError:
+    import select
+    import termios
+    import threading
+    import tty
+    from collections import defaultdict
+
+    class KeyCode:
+        def __init__(self, char):
+            self.char = char
+
+        def __eq__(self, other):
+            if isinstance(other, KeyCode):
+                return self.char == other.char
+            return NotImplemented
+
+    class KeystrokeCounter:
+        """Fallback stdin key listener for environments without X display (SSH, headless)."""
+        def __init__(self):
+            self.key_press_list = []
+            self._lock = threading.Lock()
+            self._running = False
+            self._thread = None
+            self._old_settings = None
+
+        def _read_stdin(self):
+            while self._running:
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    char = sys.stdin.read(1)
+                    with self._lock:
+                        self.key_press_list.append(KeyCode(char=char))
+
+        def __enter__(self):
+            self._running = True
+            self._old_settings = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+            self._thread = threading.Thread(target=self._read_stdin, daemon=True)
+            self._thread.start()
+            return self
+
+        def __exit__(self, *args):
+            self._running = False
+            if self._thread is not None:
+                self._thread.join(timeout=0.5)
+            if self._old_settings is not None:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_settings)
+
+        def get_press_events(self):
+            with self._lock:
+                events = list(self.key_press_list)
+                self.key_press_list.clear()
+                return events
 from umi.real_world.real_inference_util import (
     get_real_obs_resolution,
     get_real_umi_action,
@@ -56,6 +108,15 @@ XARM_START_JOINTS = np.array(
 )
 XARM_START_GRIPPER = 0.0
 DEFAULT_OUTPUT_ROOT = "/home/zinan/Documents/zinan/data/titw_eval"
+TACTILE_GEN_ROOT = "/home/zinan/Documents/zinan/Tactile_Gen"
+DEFAULT_TACGEN_MASK_PATH = os.path.join(TACTILE_GEN_ROOT, "assets", "mask.png")
+DEFAULT_TACGEN_DEPTH_CKPT = os.path.join(
+    TACTILE_GEN_ROOT,
+    "third_party",
+    "Depth-Anything-V2",
+    "checkpoints",
+    "depth_anything_v2_vitl.pth",
+)
 
 
 def make_deploy_output_dir(output_root):
@@ -101,6 +162,132 @@ def render_tactile(tactile_left, tactile_right):
     cv2.putText(right_big, "RIGHT", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     gap = np.zeros((left_big.shape[0], 20, 3), dtype=np.uint8)
     return np.concatenate([left_big, gap, right_big], axis=1)
+
+
+def render_tactile_frame(tactile_frame):
+    if tactile_frame is None:
+        return None
+    left_frame = tactile_frame[:, :32]
+    right_frame = tactile_frame[:, 32:]
+    scale = 10
+    left_vis_u8 = np.clip(left_frame * 255.0, 0, 255).astype(np.uint8)
+    right_vis_u8 = np.clip(right_frame * 255.0, 0, 255).astype(np.uint8)
+    left_color = cv2.applyColorMap(left_vis_u8, cv2.COLORMAP_VIRIDIS)
+    right_color = cv2.applyColorMap(right_vis_u8, cv2.COLORMAP_VIRIDIS)
+    h, w = left_color.shape[:2]
+    left_big = cv2.resize(left_color, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
+    right_big = cv2.resize(right_color, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
+    cv2.putText(left_big, "LEFT", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(right_big, "RIGHT", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    gap = np.zeros((left_big.shape[0], 20, 3), dtype=np.uint8)
+    return np.concatenate([left_big, gap, right_big], axis=1)
+
+
+def load_tacgen_components(tacgen_ckpt_path, tacgen_depth_encoder, tacgen_depth_ckpt, device,
+                          tacgen_mask_path=None):
+    if not os.path.exists(tacgen_ckpt_path):
+        raise FileNotFoundError(f"Tactile_Gen checkpoint not found: {tacgen_ckpt_path}")
+    if TACTILE_GEN_ROOT not in sys.path:
+        sys.path.insert(0, TACTILE_GEN_ROOT)
+
+    from tactile_gen.pipeline.detr_runtime import reconstruct_pred_grid
+    from tactile_gen.utils.vis_utils import (
+        load_depth_model,
+        load_detr_model,
+        predict_depth_map_14,
+    )
+
+    tacgen_model = load_detr_model(
+        tacgen_ckpt_path, device, mask_path_override=tacgen_mask_path,
+    ).eval()
+    tacgen_depth_model = None
+    if getattr(tacgen_model, "uses_depth", False):
+        if not os.path.exists(tacgen_depth_ckpt):
+            raise FileNotFoundError(f"Tactile_Gen depth checkpoint not found: {tacgen_depth_ckpt}")
+        tacgen_depth_model = load_depth_model(tacgen_depth_encoder, tacgen_depth_ckpt, device).eval()
+    return tacgen_model, tacgen_depth_model, reconstruct_pred_grid, predict_depth_map_14
+
+
+def _resize_rgb_frame(frame, input_size):
+    frame = frame.astype(np.float32)
+    if frame.max() > 1.5:
+        frame = frame / 255.0
+    if frame.shape[:2] != (input_size, input_size):
+        frame = cv2.resize(frame, (input_size, input_size), interpolation=cv2.INTER_AREA)
+    return np.moveaxis(frame, -1, 0)
+
+
+def _tactile_grid_to_raw_np(tactile_grid):
+    grid = tactile_grid.detach().float().cpu()
+    if grid.ndim != 4 or tuple(grid.shape[1:]) != (1, 24, 32):
+        raise ValueError(f"Expected Tactile_Gen grid shape (B, 1, 24, 32), got {tuple(grid.shape)}")
+    grid = grid[:, 0]
+    return torch.cat([grid[:, :12], grid[:, 12:]], dim=-1).numpy()
+
+
+def predict_tacgen_tactile(
+    obs,
+    tacgen_model,
+    tacgen_depth_model,
+    reconstruct_pred_grid,
+    predict_depth_map_14,
+    tactile_obs_horizon,
+    device,
+):
+    rgb_hist = obs["camera0_rgb"]
+    if len(rgb_hist) <= 0:
+        raise RuntimeError("Cannot predict tactile: camera0_rgb history is empty.")
+
+    input_size = int(getattr(tacgen_model, "input_size", 224))
+    num_frames = int(getattr(tacgen_model, "num_frames", 1))
+    frame_stride = int(getattr(tacgen_model, "frame_stride", 1))
+
+    target_start = max(0, len(rgb_hist) - tactile_obs_horizon)
+    target_indices = list(range(target_start, len(rgb_hist)))
+    if len(target_indices) < tactile_obs_horizon:
+        target_indices = [0] * (tactile_obs_horizon - len(target_indices)) + target_indices
+
+    rgb_chw = [_resize_rgb_frame(frame, input_size) for frame in rgb_hist]
+    if num_frames <= 1:
+        rgb_np = np.stack([rgb_chw[i] for i in target_indices], axis=0)
+    else:
+        seqs = []
+        for target_idx in target_indices:
+            seq_indices = [
+                max(0, target_idx - (num_frames - 1 - j) * frame_stride)
+                for j in range(num_frames)
+            ]
+            seqs.append(np.stack([rgb_chw[i] for i in seq_indices], axis=0))
+        rgb_np = np.stack(seqs, axis=0)
+
+    rgb = torch.from_numpy(rgb_np).to(device=device, dtype=torch.float32)
+    depth_kwargs = {}
+    if getattr(tacgen_model, "uses_depth_14", False):
+        depth_frames = rgb if rgb.ndim == 4 else rgb[:, -1]
+        depth_14 = []
+        for frame in depth_frames:
+            depth_s, _ = predict_depth_map_14(
+                tacgen_depth_model,
+                frame.unsqueeze(0),
+                spatial_size=getattr(tacgen_model, "spatial_size", (14, 14)),
+            )
+            depth_14.append(depth_s)
+        depth_kwargs["depth_map_14"] = torch.cat(depth_14, dim=0)
+    if getattr(tacgen_model, "uses_depth_fullres", False):
+        depth_frames = rgb if rgb.ndim == 4 else rgb[:, -1]
+        depth_fullres = []
+        for frame in depth_frames:
+            _, depth_full = predict_depth_map_14(
+                tacgen_depth_model,
+                frame.unsqueeze(0),
+                spatial_size=getattr(tacgen_model, "spatial_size", (14, 14)),
+            )
+            depth_fullres.append(depth_full)
+        depth_kwargs["depth_fullres"] = torch.cat(depth_fullres, dim=0)
+
+    preds = tacgen_model(rgb, **depth_kwargs)
+    tactile_grid = reconstruct_pred_grid(tacgen_model, preds)
+    return _tactile_grid_to_raw_np(tactile_grid).astype(np.float32)
 
 
 def recalibrate_tactile(tactile_left, tactile_right, timeout):
@@ -191,6 +378,15 @@ def draw_text(vis_img, lines):
     help='Use legacy converter image processing (full-frame PIL BILINEAR resize, no mask, no center crop).')
 @click.option('--enable_tactile', is_flag=True, default=False,
     help='Enable left/right tactile serial controllers and provide camera0_tactile to the policy.')
+@click.option('--tacgen_ckpt_path', type=str, default=None,
+    help='Tactile_Gen checkpoint path. When set, predicted tactile replaces real tactile input.')
+@click.option('--tacgen_depth_encoder', default='vitl', show_default=True,
+    type=click.Choice(['vits', 'vitb', 'vitl']),
+    help='DepthAnything encoder used only when the Tactile_Gen checkpoint expects depth.')
+@click.option('--tacgen_depth_ckpt', type=str, default=DEFAULT_TACGEN_DEPTH_CKPT, show_default=True,
+    help='DepthAnything checkpoint used only when the Tactile_Gen checkpoint expects depth.')
+@click.option('--tacgen_mask_path', type=str, default=DEFAULT_TACGEN_MASK_PATH, show_default=True,
+    help='Fisheye mask image path. Overrides the path stored in the Tactile_Gen checkpoint.')
 @click.option('--tactile_left_port', default='/dev/LeftTactile', show_default=True)
 @click.option('--tactile_right_port', default='/dev/RightTactile', show_default=True)
 @click.option('--tactile_latency', default=0.06, type=float, show_default=True,
@@ -199,10 +395,12 @@ def draw_text(vis_img, lines):
 @click.option('--tactile_buffer_size', default=300, type=int, show_default=True)
 @click.option('--tactile_buffer_fps', default=150.0, type=float, show_default=True,
     help='Expected tactile producer frequency used to choose how many recent samples to read.')
-@click.option('--flip_tactile_columns/--no_flip_tactile_columns', default=True, show_default=True,
-    help='Flip each 12x32 tactile side along columns before concatenating, matching GELLO zarr conversion.')
 @click.option('--tactile_recalibration_timeout', default=20.0, type=float, show_default=True,
     help='Seconds to wait for tactile baseline recalibration before each rollout.')
+@click.option('--profile_timing', is_flag=True, default=False,
+    help='Print per-rollout timing breakdown for diagnosing low displayed frequency.')
+@click.option('--headless', is_flag=True, default=False,
+    help='Pure CLI mode: skip all OpenCV visualization windows. Logging and video saving run normally.')
 def main(
     input,
     output,
@@ -228,17 +426,26 @@ def main(
     max_rot_speed,
     use_converter,
     enable_tactile,
+    tacgen_ckpt_path,
+    tacgen_depth_encoder,
+    tacgen_depth_ckpt,
+    tacgen_mask_path,
     tactile_left_port,
     tactile_right_port,
     tactile_latency,
     tactile_median_samples,
     tactile_buffer_size,
     tactile_buffer_fps,
-    flip_tactile_columns,
-    tactile_recalibration_timeout,
+tactile_recalibration_timeout,
+    profile_timing,
+    headless,
 ):
     if gripper_ip is None:
         gripper_ip = robot_ip
+
+    use_tacgen = tacgen_ckpt_path is not None and tacgen_ckpt_path.strip() != ""
+    if use_tacgen and enable_tactile:
+        raise RuntimeError("--enable_tactile and --tacgen_ckpt_path are mutually exclusive.")
 
     output_root = output
     output = make_deploy_output_dir(output_root)
@@ -275,13 +482,17 @@ def main(
             "xArm tactile deploy currently produces only camera0_tactile, "
             f"but checkpoint expects {tactile_keys}."
         )
-    if tactile_keys and not enable_tactile:
+    if tactile_keys and not (enable_tactile or use_tacgen):
         raise RuntimeError(
             "Checkpoint expects tactile observations "
-            f"{tactile_keys}, but --enable_tactile was not set."
+            f"{tactile_keys}, but neither --enable_tactile nor --tacgen_ckpt_path was set."
         )
     if enable_tactile and not tactile_keys:
         print("Tactile enabled, but checkpoint shape_meta has no tactile observation key.")
+    if use_tacgen and not tactile_keys:
+        raise RuntimeError(
+            "--tacgen_ckpt_path was set, but checkpoint shape_meta has no tactile observation key."
+        )
 
     # Derive deployment timing from training config to match the effective
     # observation spacing: obs_down_sample_steps / dataset_frequency.
@@ -329,6 +540,27 @@ def main(
             cfg.task.obs_down_sample_steps,
         )
 
+    device = torch.device('cuda')
+    tacgen_model = None
+    tacgen_depth_model = None
+    tacgen_reconstruct_pred_grid = None
+    tacgen_predict_depth_map_14 = None
+    if use_tacgen:
+        print("Loading Tactile_Gen model:", tacgen_ckpt_path)
+        tacgen_model, tacgen_depth_model, tacgen_reconstruct_pred_grid, tacgen_predict_depth_map_14 = (
+            load_tacgen_components(
+                tacgen_ckpt_path=tacgen_ckpt_path,
+                tacgen_depth_encoder=tacgen_depth_encoder,
+                tacgen_depth_ckpt=tacgen_depth_ckpt,
+                device=device,
+                tacgen_mask_path=tacgen_mask_path,
+            )
+        )
+        print(
+            "Tactile_Gen depth:",
+            "enabled" if getattr(tacgen_model, "uses_depth", False) else "disabled",
+        )
+
     with SharedMemoryManager() as shm_manager:
         tactile_left = None
         tactile_right = None
@@ -336,7 +568,6 @@ def main(
             print("Starting tactile controllers:")
             print("  left:", tactile_left_port)
             print("  right:", tactile_right_port)
-            print("  flip columns:", flip_tactile_columns)
             tactile_left = TactileControllerLeft(
                 shm_manager=shm_manager,
                 port_left=tactile_left_port,
@@ -377,7 +608,6 @@ def main(
             tactile_obs_horizon=tactile_obs_horizon,
             tactile_down_sample_steps=tactile_down_sample_steps,
             tactile_buffer_fps=tactile_buffer_fps,
-            flip_tactile_columns=flip_tactile_columns,
             no_mirror=no_mirror,
             fisheye_converter=fisheye_converter,
             mirror_crop=mirror_crop,
@@ -394,11 +624,12 @@ def main(
             # import pdb; pdb.set_trace()
 
 
-            cv2.setNumThreads(2)
-            cv2.namedWindow('default', cv2.WINDOW_NORMAL)
-            if enable_tactile:
-                cv2.namedWindow('tactile', cv2.WINDOW_NORMAL)
-            print("Waiting for camera/tactile" if enable_tactile else "Waiting for camera")
+            if not headless:
+                cv2.setNumThreads(2)
+                cv2.namedWindow('default', cv2.WINDOW_NORMAL)
+                if enable_tactile or use_tacgen:
+                    cv2.namedWindow('tactile', cv2.WINDOW_NORMAL)
+            print("Waiting for camera/tactile" if (enable_tactile or use_tacgen) else "Waiting for camera")
             time.sleep(2.0 if enable_tactile else 1.0)
 
             cls = hydra.utils.get_class(cfg._target_)
@@ -416,7 +647,6 @@ def main(
             print('obs_pose_rep', obs_pose_rep)
             print('action_pose_repr', action_pose_repr)
 
-            device = torch.device('cuda')
             policy.eval().to(device)
 
             print("Warming up policy inference")
@@ -432,6 +662,16 @@ def main(
             ], axis=-1)[-1]]
             with torch.no_grad():
                 policy.reset()
+                if use_tacgen:
+                    obs['camera0_tactile'] = predict_tacgen_tactile(
+                        obs=obs,
+                        tacgen_model=tacgen_model,
+                        tacgen_depth_model=tacgen_depth_model,
+                        reconstruct_pred_grid=tacgen_reconstruct_pred_grid,
+                        predict_depth_map_14=tacgen_predict_depth_map_14,
+                        tactile_obs_horizon=tactile_obs_horizon,
+                        device=device,
+                    )
                 obs_dict_np = get_real_umi_obs_dict(
                     env_obs=obs,
                     shape_meta=cfg.task.shape_meta,
@@ -457,31 +697,38 @@ def main(
             ran_auto_episode = False
 
             while not should_quit:
-                print('Idle. Press "c" to start rollout, "s" to stop (during rollout), "q" to quit.')
+                print('Idle. Press "s" to start rollout, "s" again to stop (during rollout), "q" to quit.')
                 t_idle_start = time.monotonic()
                 iter_idx = 0
+                cycle_times = []
                 while True:
+                    t_cycle_start = time.monotonic()
                     t_cycle_end = t_idle_start + (iter_idx + 1) * dt
                     obs = env.get_obs()
-                    vis_img = render_preview(env, obs, vis_camera_idx, mirror_crop)
                     episode_id = env.replay_buffer.n_episodes
-                    draw_text(vis_img, [
-                        f'Episode: {episode_id}',
-                        'Mode: idle',
-                        'Keys: c=start, s=stop (during rollout), q=quit',
-                    ])
-                    cv2.imshow('default', vis_img)
-                    if enable_tactile:
-                        tactile_vis = render_tactile(env.tactile_left, env.tactile_right)
-                        if tactile_vis is not None:
-                            cv2.imshow('tactile', tactile_vis)
-                    _ = cv2.pollKey()
+                    cycle_times.append(time.monotonic() - t_cycle_start)
+                    if len(cycle_times) > 10:
+                        cycle_times.pop(0)
+                    if not headless:
+                        vis_img = render_preview(env, obs, vis_camera_idx, mirror_crop)
+                        freq_str = f"{1.0 / (sum(cycle_times) / len(cycle_times)):.1f} Hz"
+                        draw_text(vis_img, [
+                            f'Episode: {episode_id}',
+                            f'Mode: idle  Freq: {freq_str}',
+                            'Keys: s=start/stop, q=quit',
+                        ])
+                        cv2.imshow('default', vis_img)
+                        if enable_tactile:
+                            tactile_vis = render_tactile(env.tactile_left, env.tactile_right)
+                            if tactile_vis is not None:
+                                cv2.imshow('tactile', tactile_vis)
+                        _ = cv2.pollKey()
 
                     start_policy = auto_start and not ran_auto_episode
                     for key_stroke in key_counter.get_press_events():
                         if key_stroke == KeyCode(char='q'):
                             should_quit = True
-                        elif key_stroke == KeyCode(char='c'):
+                        elif key_stroke == KeyCode(char='s'):
                             start_policy = True
 
                     if should_quit or start_policy:
@@ -517,33 +764,57 @@ def main(
                     ], axis=-1)[-1]]
                     print("Started rollout.")
                     iter_idx = 0
+                    rollout_cycle_times = []
 
                     while True:
+                        t_cycle_start = time.monotonic()
                         t_cycle_end = rollout_t_start + (iter_idx + steps_per_inference) * dt
+                        t_obs_start = time.monotonic()
                         obs = env.get_obs()
+                        t_after_obs = time.monotonic()
                         obs_timestamps = obs['timestamp']
                         print(f'Obs latency {time.time() - obs_timestamps[-1]}')
 
                         with torch.no_grad():
-                            infer_start = time.time()
+                            infer_start = time.monotonic()
+                            t_tacgen_start = time.monotonic()
+                            if use_tacgen:
+                                obs['camera0_tactile'] = predict_tacgen_tactile(
+                                    obs=obs,
+                                    tacgen_model=tacgen_model,
+                                    tacgen_depth_model=tacgen_depth_model,
+                                    reconstruct_pred_grid=tacgen_reconstruct_pred_grid,
+                                    predict_depth_map_14=tacgen_predict_depth_map_14,
+                                    tactile_obs_horizon=tactile_obs_horizon,
+                                    device=device,
+                                )
+                            t_after_tacgen = time.monotonic()
+                            t_obs_dict_start = time.monotonic()
                             obs_dict_np = get_real_umi_obs_dict(
                                 env_obs=obs,
                                 shape_meta=cfg.task.shape_meta,
                                 obs_pose_repr=obs_pose_rep,
                                 episode_start_pose=episode_start_pose,
                             )
+                            t_after_obs_dict = time.monotonic()
+                            t_tensor_start = time.monotonic()
                             obs_dict = dict_apply(
                                 obs_dict_np,
                                 lambda x: torch.from_numpy(x).unsqueeze(0).to(device),
                             )
+                            t_after_tensor = time.monotonic()
+                            t_policy_start = time.monotonic()
                             result = policy.predict_action(obs_dict)
+                            t_after_policy = time.monotonic()
+                            t_action_start = time.monotonic()
                             raw_action = result['action_pred'][0].detach().to('cpu').numpy()
                             action = get_real_umi_action(
                                 raw_action,
                                 obs,
                                 action_pose_repr,
                             )
-                            print('Inference latency:', time.time() - infer_start)
+                            t_after_action_convert = time.monotonic()
+                            print('Inference latency:', t_after_action_convert - infer_start)
 
                         action_timestamps = (
                             np.arange(len(action), dtype=np.float64) * dt + obs_timestamps[-1]
@@ -560,25 +831,58 @@ def main(
                             action = action[is_new]
                             action_timestamps = action_timestamps[is_new]
 
+                        t_exec_start = time.monotonic()
                         env.exec_actions(
                             actions=action,
                             timestamps=action_timestamps,
                             compensate_latency=True,
                         )
+                        t_after_exec = time.monotonic()
                         print(f"Submitted {len(action)} steps of actions.")
 
-                        vis_img = render_preview(env, obs, vis_camera_idx, mirror_crop)
-                        draw_text(vis_img, [
-                            f'Episode: {env.replay_buffer.n_episodes}',
-                            f'Mode: rollout {time.monotonic() - rollout_t_start:.1f}s',
-                            'Keys: s=stop, q=quit',
-                        ])
-                        cv2.imshow('default', vis_img)
-                        if enable_tactile:
-                            tactile_vis = render_tactile(env.tactile_left, env.tactile_right)
-                            if tactile_vis is not None:
-                                cv2.imshow('tactile', tactile_vis)
-                        _ = cv2.pollKey()
+                        t_render_start = time.monotonic()
+                        if not headless:
+                            vis_img = render_preview(env, obs, vis_camera_idx, mirror_crop)
+                        t_after_render = time.monotonic()
+                        rollout_cycle_times.append(time.monotonic() - t_cycle_start)
+                        if len(rollout_cycle_times) > 10:
+                            rollout_cycle_times.pop(0)
+                        if not headless:
+                            freq_str = f"{1.0 / (sum(rollout_cycle_times) / len(rollout_cycle_times)):.1f} Hz"
+                            draw_text(vis_img, [
+                                f'Episode: {env.replay_buffer.n_episodes}',
+                                f'Mode: rollout {time.monotonic() - rollout_t_start:.1f}s  Freq: {freq_str}',
+                                'Keys: s=stop, q=quit',
+                            ])
+                            cv2.imshow('default', vis_img)
+                            if enable_tactile:
+                                tactile_vis = render_tactile(env.tactile_left, env.tactile_right)
+                                if tactile_vis is not None:
+                                    cv2.imshow('tactile', tactile_vis)
+                            elif use_tacgen:
+                                tactile_vis = render_tactile_frame(obs['camera0_tactile'][-1])
+                                if tactile_vis is not None:
+                                    cv2.imshow('tactile', tactile_vis)
+                            _ = cv2.pollKey()
+                        t_after_vis = time.monotonic()
+
+                        if profile_timing:
+                            loop_compute = t_after_vis - t_cycle_start
+                            target_margin = (t_cycle_end - frame_latency) - time.monotonic()
+                            timing_parts = [
+                                f"get_obs={t_after_obs - t_obs_start:.3f}s",
+                                f"tacgen={t_after_tacgen - t_tacgen_start:.3f}s",
+                                f"obs_dict={t_after_obs_dict - t_obs_dict_start:.3f}s",
+                                f"to_gpu={t_after_tensor - t_tensor_start:.3f}s",
+                                f"policy={t_after_policy - t_policy_start:.3f}s",
+                                f"action_conv={t_after_action_convert - t_action_start:.3f}s",
+                                f"exec={t_after_exec - t_exec_start:.3f}s",
+                                f"render={t_after_render - t_render_start:.3f}s",
+                                f"imshow={t_after_vis - t_after_render:.3f}s",
+                                f"loop={loop_compute:.3f}s",
+                                f"sleep_margin={target_margin:.3f}s",
+                            ]
+                            print("[Timing] " + " ".join(timing_parts))
 
                         stop_episode = False
                         for key_stroke in key_counter.get_press_events():
